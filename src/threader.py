@@ -365,9 +365,58 @@ class ThreadPainter:
         return threads
 
 
-# --------------------------------------------------------------------------
-# Writers
-# --------------------------------------------------------------------------
+def render_threads(
+    threads: np.ndarray,
+    width_px: int,
+    height_px: int,
+    background: Sequence[float],
+    thread_width: float,
+) -> np.ndarray:
+    """Render an N x 8 thread matrix onto a background canvas."""
+    c_channels = len(background)
+    canvas = np.empty((height_px, width_px, c_channels), dtype=np.float32)
+    canvas[:] = np.asarray(background, dtype=np.float32).reshape(1, 1, -1)
+    half_width = float(thread_width) / 2.0
+    reach = half_width + 1.0
+
+    scale = np.array([width_px, height_px, width_px, height_px], dtype=np.float32)
+    lines = threads[:, :4].astype(np.float32) * scale
+    colors = (
+        threads[:, 4:4 + c_channels].astype(np.float32)
+        if threads.shape[1] >= 4 + c_channels
+        else threads[:, 4:7].astype(np.float32)
+    )
+    alphas = threads[:, 7].astype(np.float32)
+
+    for i in range(len(threads)):
+        x0, y0, x1, y1 = lines[i]
+        xa = max(int(math.floor(min(x0, x1) - reach)), 0)
+        xb = min(int(math.ceil(max(x0, x1) + reach)), width_px)
+        ya = max(int(math.floor(min(y0, y1) - reach)), 0)
+        yb = min(int(math.ceil(max(y0, y1) + reach)), height_px)
+        if xa >= xb or ya >= yb:
+            continue
+
+        px = (np.arange(xa, xb, dtype=np.float32) + 0.5)[None, :]
+        py = (np.arange(ya, yb, dtype=np.float32) + 0.5)[:, None]
+        dx, dy = x1 - x0, y1 - y0
+        len2 = dx * dx + dy * dy
+        if len2 > 1e-9:
+            t = np.clip(((px - x0) * dx + (py - y0) * dy) / len2, 0.0, 1.0)
+            ddx = px - (x0 + t * dx)
+            ddy = py - (y0 + t * dy)
+        else:
+            ddx = px - x0
+            ddy = py - y0
+        dist = np.sqrt(ddx * ddx + ddy * ddy)
+        coverage = np.clip(half_width + 0.5 - dist, 0.0, 1.0)
+
+        m = (alphas[i] * coverage)[:, :, None]
+        canvas[ya:yb, xa:xb] = canvas[ya:yb, xa:xb] * (1.0 - m) + m * colors[i]
+
+    return canvas
+
+
 def save_png(path: str, canvas: np.ndarray) -> None:
     pixels = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
     if pixels.shape[2] == 1:
@@ -440,7 +489,28 @@ def run_job(job: dict[str, Any]) -> list[str]:
         save_svg(base + ".svg", threads, width, height, background, job["thread_width"])
         written.extend([base + ".png", base + ".svg"])
         if job["save_npy"]:
-            np.save(base + ".npy", threads)
+            dtype = job["npy_dtype"]
+            if dtype == "uint4":
+                q = np.clip(np.round(threads * 15.0), 0, 15).astype(np.uint8)
+                packed = np.empty((len(threads), 4), dtype=np.uint8)
+                for i in range(4):
+                    packed[:, i] = (q[:, 2 * i] << 4) | (q[:, 2 * i + 1] & 0x0F)
+                recon = q.astype(np.float32) / 15.0
+                u4_canvas = render_threads(recon, width, height, paint_bg, job["thread_width"])
+                save_png(base + "_uint4.png", u4_canvas)
+                save_svg(base + "_uint4.svg", recon, width, height, background, job["thread_width"])
+                written.extend([base + "_uint4.png", base + "_uint4.svg"])
+                matrix = packed
+            elif dtype == "uint8":
+                matrix = np.clip(np.round(threads * 255.0), 0, 255).astype(np.uint8)
+                recon = matrix.astype(np.float32) / 255.0
+                u8_canvas = render_threads(recon, width, height, paint_bg, job["thread_width"])
+                save_png(base + "_uint8.png", u8_canvas)
+                save_svg(base + "_uint8.svg", recon, width, height, background, job["thread_width"])
+                written.extend([base + "_uint8.png", base + "_uint8.svg"])
+            else:
+                matrix = threads.astype(np.float32)
+            np.save(base + ".npy", matrix)
             written.append(base + ".npy")
         mse = float(((target - canvas) ** 2).mean())
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-12))
@@ -468,6 +538,14 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="thread counts to export (default: 5000 10000 15000 20000)",
     )
     parser.add_argument(
+        "--modes", nargs="+", choices=list(MODES), default=list(MODES),
+        help=f"colour modes to run: color, bw (default: {' '.join(MODES)})",
+    )
+    parser.add_argument(
+        "--alphas", type=float, nargs="+", default=list(ALPHAS),
+        help=f"thread alphas to run (default: {' '.join(str(a) for a in ALPHAS)})",
+    )
+    parser.add_argument(
         "--size", type=int, default=640,
         help="length in px of the longest side of the output (default: 640)",
     )
@@ -485,8 +563,12 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="parallel worker processes (default: up to 4, limited by CPU count)",
     )
     parser.add_argument(
-        "--npy", action="store_true",
-        help="also save each thread matrix (N x 8, float32) as .npy",
+        "--npy", nargs="?", const="float32", default=None, choices=["float32", "uint8", "uint4"],
+        help="save thread matrices (N x 8) as .npy (format: float32, uint8, or uint4; default: float32)",
+    )
+    parser.add_argument(
+        "--npy-dtype", choices=["float32", "uint8", "uint4"], default=None,
+        help="explicit data type for .npy export: float32, uint8, or uint4",
     )
     args = parser.parse_args(argv)
 
@@ -497,6 +579,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     if args.width <= 0:
         parser.error("--width must be positive")
     args.counts = sorted(set(args.counts))
+
+    npy_dtype = args.npy_dtype or args.npy
+    args.save_npy = bool(npy_dtype)
+    args.npy_dtype = npy_dtype or "float32"
     return args
 
 
@@ -534,9 +620,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "background": args.bg,
             "thread_width": args.width,
             "seed": args.seed + 1000 * index,
-            "save_npy": args.npy,
+            "save_npy": args.save_npy,
+            "npy_dtype": args.npy_dtype,
         }
-        for index, (mode, alpha) in enumerate(itertools.product(MODES, ALPHAS))
+        for index, (mode, alpha) in enumerate(itertools.product(args.modes, args.alphas))
     ]
 
     workers = args.jobs if args.jobs else min(4, os.cpu_count() or 1)
