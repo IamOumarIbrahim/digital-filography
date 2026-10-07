@@ -25,7 +25,7 @@ Threads are rendered in sequential order from $1$ to $N$. Because recognition re
 
 ### Quantization & Precision Benchmark Table
 
-![Quantization vs Thread Counts Grid](D:\Downloads\house-cat_MIZQ6V1ZJU_threads\house-cat_MIZQ6V1ZJU_quantization_vs_counts_grid.png)
+![Quantization vs Thread Counts Grid](images/quantization_vs_counts_grid.png)
 
 The table below evaluates reconstruction quality, storage requirements, generation runtime, and computational complexity across **10 thread counts** ($100$ to $5{,}000$) and **6 precision tiers** (`float32`, `float16`, `uint8`, `uint6`, `uint5`, `uint4`).
 
