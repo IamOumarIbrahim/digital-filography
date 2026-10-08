@@ -23,39 +23,18 @@ import pandas as pd
 from PIL import Image
 
 
-TARGET_CLASSES = [
-    "person",
-    "car", "truck", "bus",
-    "chair", "couch", "dining table",
-    "bottle", "cup", "bowl", "wine glass",
-    "bird", "dog", "cat", "horse",
-    "umbrella", "handbag", "backpack",
-    "bicycle", "motorcycle",
-    "traffic light", "airplane", "boat",
-]
+
+TARGET_CLASSES = ["person", "car", "truck", "bus"]
 
 CATEGORIES = {
     "person": ["person"],
     "vehicle": ["car", "truck", "bus"],
-    "indoor_geometry": ["chair", "couch", "dining table"],
-    "small_objects": ["bottle", "cup", "bowl", "wine glass"],
-    "animals": ["dog", "cat", "horse", "bird"],
-    "false_positives": ["umbrella", "handbag", "backpack"],
-    "thin_structures": ["bicycle", "motorcycle"],
-    "other": ["traffic light", "airplane", "boat"],
 }
 
 TARGET_RANGES = {
-    "person": {"target_imgs": (40, 46), "target_inst": (180, 220), "label": "person"},
-    "vehicle": {"target_imgs": (25, 30), "target_inst": (90, 110), "label": "car / truck / bus"},
-    "indoor_geometry": {"target_imgs": (20, 25), "target_inst": (70, 90), "label": "chair / couch / dining table"},
-    "small_objects": {"target_imgs": (20, 25), "target_inst": (60, 80), "label": "bottle / cup / bowl / wine glass"},
-    "animals": {"target_imgs": (25, 32), "target_inst": (60, 80), "label": "dog / cat / horse / bird"},
-    "false_positives": {"target_imgs": (10, 15), "target_inst": (30, 40), "label": "umbrella / handbag / backpack"},
-    "thin_structures": {"target_imgs": (10, 12), "target_inst": (25, 35), "label": "bicycle / motorcycle"},
-    "other": {"target_imgs": (10, 15), "target_inst": (20, 36), "label": "Other (traffic light, etc.)"},
+    "person":  {"target_imgs": (245, 255), "target_inst": (0, 10**6), "label": "person"},
+    "vehicle": {"target_imgs": (745, 755), "target_inst": (0, 10**6), "label": "car / truck / bus"},
 }
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -70,19 +49,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pool-size",
         type=int,
-        default=380,
+        default=3000,
         help="Candidate pool size in FiftyOne Zoo (default: 380)",
     )
     parser.add_argument(
         "--final-samples",
         type=int,
-        default=150,
+        default=1000,
         help="Final number of balanced samples to select (default: 150)",
     )
     parser.add_argument(
         "--split",
         type=str,
-        default="validation",
+        default="train",
         help="COCO split (default: validation)",
     )
     parser.add_argument(
@@ -98,8 +77,8 @@ def optimize_balanced_subset(
     pool: list[dict[str, Any]],
     target_count: int = 150,
     seed: int = 42,
-    restarts: int = 25,
-    steps_per_restart: int = 5000,
+    restarts: int = 5,
+    steps_per_restart: int = 20000,
 ) -> list[dict[str, Any]]:
     """Select exactly target_count images minimizing deviation from class and instance targets."""
     all_idx = list(range(len(pool)))
@@ -189,6 +168,13 @@ def main() -> int:
     for sample in pool_dataset:
         filepath = sample.filepath
         filename = os.path.basename(filepath)
+                # Skip images corrupted by interrupted downloads
+        try:
+            with Image.open(filepath) as _img:
+                _img.load()
+        except Exception:
+            print(f"  Skipping unreadable image: {filename}")
+            continue
         detections = []
         classes_in_sample: set[str] = set()
         cat_counts = {cat: 0 for cat in CATEGORIES}

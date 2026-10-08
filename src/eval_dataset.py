@@ -38,14 +38,12 @@ if SRC_DIR not in sys.path:
 from threader import ThreadPainter, load_image, render_threads
 
 
-TIERS = ("float16", "uint8", "uint6", "uint4")
+TIERS = ("float16", "uint8", "uint6")
 BYTES_PER_THREAD = {
     "float32": 32,
     "float16": 16,
     "uint8": 8,
     "uint6": 6,
-    "uint5": 5,
-    "uint4": 4,
 }
 FLOP_CANDIDATES_PER_THREAD = 304
 
@@ -108,8 +106,7 @@ def fresh_predict(
     conf: float = 0.25,
 ) -> tuple[Any, float]:
     """Execute stateless inference clearing GPU cache to prevent memory retention."""
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.empty_cache()
+
 
     t0 = time.perf_counter()
     results = model.predict(
@@ -121,9 +118,7 @@ def fresh_predict(
     )
     inference_ms = (time.perf_counter() - t0) * 1000.0
 
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.empty_cache()
-    gc.collect()
+
 
     return results[0], inference_ms
 
@@ -137,6 +132,7 @@ def worker_thread_placement(args_tuple: tuple[int, str, int, Sequence[float], fl
     painter = ThreadPainter(target, alpha, bg, thread_width, seed)
     snaps: dict[int, np.ndarray] = {}
     painter.run(counts, lambda n, t, c: snaps.update({n: t.copy()}))
+    snaps[0] = np.zeros((0, 8), dtype=np.float32)  # 0 threads = blank canvas
     return idx, img_path, w, h, snaps
 
 
@@ -330,13 +326,39 @@ def main() -> int:
         (cnt, tier): {"psnr_sum": 0.0, "time_sum": 0.0, "count": 0}
         for cnt in thread_counts for tier in TIERS
     }
-
+        # --- checkpoint / resume ---
+    ckpt_path = os.path.join(args.output_dir, "checkpoint_rows.jsonl")
+    done_images: set[int] = set()
+    seen_psnr: set[tuple[int, int, str]] = set()
+    if os.path.exists(ckpt_path):
+        pending: dict[int, list[dict[str, Any]]] = {}
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # last line may be cut off after a crash
+                if "_done" in rec:
+                    i = rec["_done"]
+                    for r in pending.pop(i, []):
+                        all_filo_rows.append(r)
+                        key = (r["image_id"], r["thread_count"], r["quantization"])
+                        if key not in seen_psnr:
+                            seen_psnr.add(key)
+                            g = gen_metrics_accum[(r["thread_count"], r["quantization"])]
+                            g["psnr_sum"] += r["psnr_db"]
+                            g["count"] += 1
+                    done_images.add(i)
+                else:
+                    pending.setdefault(rec["image_id"], []).append(rec)
+        print(f"Resuming: {len(done_images)} images already completed in {ckpt_path}")
+    session_total = total_images - len(done_images)
     t_eval_start = time.time()
     completed_images = 0
 
     # Process images with pool executor
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        future_to_idx = {executor.submit(worker_thread_placement, t): t[0] for t in worker_tasks}
+        future_to_idx = {executor.submit(worker_thread_placement, t): t[0] for t in worker_tasks if t[0] not in done_images}
 
         for future in as_completed(future_to_idx):
             idx, img_path, w, h, snaps = future.result()
@@ -349,6 +371,7 @@ def main() -> int:
 
             # Evaluate all thread counts and quantizations for this image
             t_img_start = time.time()
+            img_start_len = len(all_filo_rows)
             for count in thread_counts:
                 raw_threads = snaps[count]
                 flops = count * FLOP_CANDIDATES_PER_THREAD * (w * h / 1000.0)
@@ -436,12 +459,14 @@ def main() -> int:
                             "psnr_db": psnr,
                             "all_detections": ", ".join(all_preds_str) if all_preds_str else "none",
                         })
-
+            with open(ckpt_path, "a", encoding="utf-8") as ck:
+                ck.write("".join(json.dumps(r) + "\n" for r in all_filo_rows[img_start_len:]))
+                ck.write(json.dumps({"_done": idx}) + "\n")
             elapsed = time.time() - t_eval_start
             rate = completed_images / max(elapsed, 1e-6)
-            rem = (total_images - completed_images) / rate
-            if completed_images % 5 == 0 or completed_images == total_images:
-                print(f"  Progress: {completed_images:3d}/{total_images} images completed ({elapsed/60.0:4.1f}m elapsed, ~{rem/60.0:4.1f}m rem)")
+            rem = (session_total - completed_images) / rate
+            if completed_images % 5 == 0 or completed_images == session_total:
+                print(f"  Progress: {completed_images + len(done_images):3d}/{total_images} images completed ({elapsed/60.0:4.1f}m elapsed, ~{rem/60.0:4.1f}m rem)")
 
     print(f"\nAll {total_images} images successfully evaluated in {(time.time() - t_eval_start)/60.0:.2f} minutes.")
 
