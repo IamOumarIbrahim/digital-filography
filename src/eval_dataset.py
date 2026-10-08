@@ -1,34 +1,50 @@
 #!/usr/bin/env python3
-"""eval_dataset.py: Full-dataset benchmark across 150 images, 5 YOLO models, and 4 quantizations.
+"""eval_dataset.py: Full-dataset benchmark of digital filography against detector baselines.
 
-Evaluates 150 diverse COCO images across:
-- 5 models: YOLOv8n, YOLOv10n, YOLO11n, YOLO12n, YOLO26n
-- 40 thread counts: 250 to 10,000 threads (step 250)
-- 4 precision tiers: float16, uint8, uint6, uint4 (fp32 and uint5 dropped)
-- Model-relative baseline detection: Each model's predictions on the uncompressed
-  baseline photo serve as ground truth for evaluating its filographic reconstructions.
-- High-performance multi-core parallel thread placement via ProcessPoolExecutor.
-- Automatic regeneration of publication graphs upon benchmark completion.
+For every image in the dataset manifest and every detector model:
+- The model is run on the uncompressed (resized) photo. Its detections are that
+  model's own baseline.
+- Filography reconstructions are rendered at many thread counts and 3 precision
+  tiers (float16, uint8, uint6) and run through the same model.
+- Each reconstruction is scored against the same model's baseline:
+
+      recovery_rate = matched baseline objects / baseline objects
+      precision     = matched baseline objects / predicted objects
+      f1            = 2 * matched / (baseline objects + predicted objects)
+
+  A prediction matches a baseline object when the class name is equal and
+  IoU >= 0.50. Matching is greedy (highest confidence first) and each baseline
+  object can be matched once, so extra detections count as false positives.
+  Summary rows pool object counts across images (micro average).
+
+What is deliberately NOT reported:
+- No mAP. Matching at IoU 0.50 first and then averaging IoUs is not mAP.
+  Add COCO AP separately if it is needed.
+- No inference time. Placement workers compete with the detector for CPU and
+  GPU, so the timings are not meaningful.
+- "Recovery" is relative to each model's own output on the original photo. It
+  measures how much of what the model sees in the original survives, not
+  accuracy against COCO labels.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import gc
 import json
 import math
 import os
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Sequence
 
 import numpy as np
-from PIL import Image
 import torch
-from ultralytics import YOLO
+from PIL import Image
+from ultralytics import RTDETR, YOLO, YOLOWorld
 
 # Add src to sys.path
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +54,7 @@ if SRC_DIR not in sys.path:
 from threader import ThreadPainter, load_image, render_threads
 
 
+SCHEMA_VERSION = 2
 TIERS = ("float16", "uint8", "uint6")
 BYTES_PER_THREAD = {
     "float32": 32,
@@ -46,8 +63,17 @@ BYTES_PER_THREAD = {
     "uint6": 6,
 }
 FLOP_CANDIDATES_PER_THREAD = 304
+IOU_MATCH = 0.50
+RELIABLE_RECOVERY = 0.50
+# The end-of-run summary reports this thread count. The default grid
+# (250..10000, step 250) contains it. If a custom grid omits it, the largest
+# thread count in the grid is used instead of crashing.
+SUMMARY_THREAD_COUNT = 10000
 
 
+# -----------------------------------------------------------------------------
+# Geometry, matching and quantization
+# -----------------------------------------------------------------------------
 def compute_iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     """Compute Intersection over Union (IoU) between two boxes [x1, y1, x2, y2]."""
     xa = max(box_a[0], box_b[0])
@@ -68,17 +94,38 @@ def compute_iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     return float(inter_area / union_area)
 
 
-def compute_map50_95(ious: list[float]) -> tuple[float, float, float]:
-    """Compute mAP50, mAP75, and mAP50:95 from a list of matched IoU values."""
-    if not ious:
-        return 0.0, 0.0, 0.0
-    thresholds = [0.50 + 0.05 * i for i in range(10)]
-    hits_50 = sum(1.0 for iou in ious if iou >= 0.50) / len(ious)
-    hits_75 = sum(1.0 for iou in ious if iou >= 0.75) / len(ious)
+def match_detections(
+    preds: list[dict[str, Any]],
+    baseline: list[dict[str, Any]],
+    iou_thr: float = IOU_MATCH,
+) -> tuple[list[float], list[float]]:
+    """Greedily match predictions to baseline objects (same class, IoU >= iou_thr).
 
-    all_hits = sum(sum(1.0 for iou in ious if iou >= t) / len(ious) for t in thresholds)
-    map50_95 = all_hits / len(thresholds)
-    return hits_50, hits_75, map50_95
+    Predictions are visited in descending confidence order and each baseline
+    object is matched at most once. Returns (matched_ious, matched_confs); the
+    number of true positives is len(matched_ious). Unmatched predictions are
+    false positives.
+    """
+    matched_ious: list[float] = []
+    matched_confs: list[float] = []
+    used: set[int] = set()
+
+    for p in sorted(preds, key=lambda d: d["conf"], reverse=True):
+        best_iou = 0.0
+        best_idx = -1
+        for i, b in enumerate(baseline):
+            if i in used or b["cls_name"] != p["cls_name"]:
+                continue
+            iou = compute_iou(p["box"], b["box"])
+            if iou >= iou_thr and iou > best_iou:
+                best_iou = iou
+                best_idx = i
+        if best_idx >= 0:
+            used.add(best_idx)
+            matched_ious.append(best_iou)
+            matched_confs.append(p["conf"])
+
+    return matched_ious, matched_confs
 
 
 def quantize_threads(threads: np.ndarray, tier: str) -> np.ndarray:
@@ -99,16 +146,38 @@ def quantize_threads(threads: np.ndarray, tier: str) -> np.ndarray:
         raise ValueError(f"Unknown tier: {tier}")
 
 
+# -----------------------------------------------------------------------------
+# Model loading and inference
+# -----------------------------------------------------------------------------
+def load_model(path: str):
+    """Load a YOLO, RT-DETR or YOLO-World checkpoint based on the file name."""
+    name = os.path.basename(path).lower()
+    if name.startswith("rtdetr"):
+        return RTDETR(path)
+    if "world" in name:
+        m = YOLOWorld(path)
+        m.set_classes(["person", "car", "bus", "truck", "motorcycle", "bicycle"])
+        return m
+    return YOLO(path)
+
+
+def class_name(names: Any, cid: int) -> str:
+    """Resolve a class id to a lowercase name for dict or list style name tables."""
+    if isinstance(names, dict):
+        return str(names.get(cid, cid)).lower()
+    try:
+        return str(names[cid]).lower()
+    except (IndexError, KeyError, TypeError):
+        return str(cid)
+
+
 def fresh_predict(
-    model: YOLO,
+    model: Any,
     image: Image.Image | np.ndarray,
     device: str,
     conf: float = 0.25,
-) -> tuple[Any, float]:
-    """Execute stateless inference clearing GPU cache to prevent memory retention."""
-
-
-    t0 = time.perf_counter()
+) -> Any:
+    """Run stateless single-image inference and return the Results object."""
     results = model.predict(
         source=image,
         device=device,
@@ -116,15 +185,154 @@ def fresh_predict(
         stream=False,
         verbose=False,
     )
-    inference_ms = (time.perf_counter() - t0) * 1000.0
+    return results[0]
 
 
+def extract_detections(res: Any) -> list[dict[str, Any]]:
+    """Convert an Ultralytics Results object into a confidence-sorted detection list."""
+    boxes = res.boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+    cls_ids = boxes.cls.cpu().numpy().astype(int)
+    confs = boxes.conf.cpu().numpy()
+    xyxy = boxes.xyxy.cpu().numpy()
+    dets = [
+        {
+            "cls_name": class_name(res.names, int(cid)),
+            "conf": float(c),
+            "box": [float(v) for v in box],
+        }
+        for cid, c, box in zip(cls_ids, confs, xyxy)
+    ]
+    dets.sort(key=lambda d: d["conf"], reverse=True)
+    return dets
 
-    return results[0], inference_ms
+
+def fmt_dets(dets: list[dict[str, Any]]) -> str:
+    if not dets:
+        return "none"
+    return ", ".join(f"{d['cls_name']} ({d['conf']:.2f})" for d in dets)
+
+
+# -----------------------------------------------------------------------------
+# Row building and aggregation
+# -----------------------------------------------------------------------------
+def build_row(
+    *,
+    image_id: int,
+    filename: str,
+    model: str,
+    image_type: str,
+    thread_count: int,
+    quantization: str,
+    n_base: int,
+    n_pred: int,
+    n_tp: int,
+    mean_conf: float,
+    mean_iou: float,
+    psnr: float | None,
+    all_dets: str,
+) -> dict[str, Any]:
+    """Build one result row. recovery_rate/precision are None when undefined."""
+    bpt = BYTES_PER_THREAD.get(quantization, 0)
+    return {
+        "image_id": image_id,
+        "filename": filename,
+        "model": model,
+        "image_type": image_type,
+        "thread_count": thread_count,
+        "quantization": quantization,
+        "bytes_per_thread": bpt,
+        "storage_kb": round(thread_count * bpt / 1000.0, 2),
+        "baseline_objects": n_base,
+        "predicted_objects": n_pred,
+        "recovered_objects": n_tp,
+        "recovery_rate": round(n_tp / n_base, 4) if n_base else None,
+        "precision": round(n_tp / n_pred, 4) if n_pred else None,
+        "confidence": round(mean_conf, 4),
+        "iou": round(mean_iou, 4),
+        "psnr_db": psnr,
+        "all_detections": all_dets,
+    }
+
+
+def _r(x: float | None, nd: int = 4) -> float | None:
+    return None if x is None else round(float(x), nd)
+
+
+def aggregate_group(model: str, count: int, tier: str, sub: list[dict[str, Any]]) -> dict[str, Any]:
+    """Micro-average one (model, thread_count, tier) group across images."""
+    n_base = sum(r["baseline_objects"] for r in sub)
+    n_pred = sum(r["predicted_objects"] for r in sub)
+    n_tp = sum(r["recovered_objects"] for r in sub)
+
+    recovery = n_tp / n_base if n_base else None
+    precision = n_tp / n_pred if n_pred else None
+    f1 = 2.0 * n_tp / (n_base + n_pred) if (n_base + n_pred) else None
+    mean_conf = sum(r["confidence"] * r["recovered_objects"] for r in sub) / n_tp if n_tp else None
+    mean_iou = sum(r["iou"] * r["recovered_objects"] for r in sub) / n_tp if n_tp else None
+
+    return {
+        "model": model,
+        "thread_count": count,
+        "quantization": tier,
+        "bytes_per_thread": BYTES_PER_THREAD[tier],
+        "storage_kb": sub[0]["storage_kb"],
+        "recovery_rate": _r(recovery),
+        "precision": _r(precision),
+        "f1": _r(f1),
+        "mean_confidence": _r(mean_conf),
+        "mean_iou": _r(mean_iou),
+        "mean_psnr_db": round(float(np.mean([r["psnr_db"] for r in sub])), 2),
+        "baseline_objects": n_base,
+        "predicted_objects": n_pred,
+        "recovered_objects": n_tp,
+        "images_evaluated": len(sub),
+        "images_with_baseline": sum(1 for r in sub if r["baseline_objects"] > 0),
+    }
+
+
+def pct(x: float | None) -> str:
+    return "n/a" if x is None else f"{x * 100:.1f}%"
+
+
+# -----------------------------------------------------------------------------
+# Checkpointing
+# -----------------------------------------------------------------------------
+def read_checkpoint(path: str) -> tuple[dict[str, Any] | None, dict[int, list[dict[str, Any]]]]:
+    """Read a checkpoint file. Returns (meta, finished_rows_by_image).
+
+    Rows only count once their image's `_done` marker is present. Duplicate rows
+    (from a crash and re-run of the same image) are collapsed by key.
+    """
+    meta: dict[str, Any] | None = None
+    pending: dict[int, dict[tuple[str, int, str], dict[str, Any]]] = {}
+    finished: dict[int, list[dict[str, Any]]] = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # last line may be cut off after a crash
+            if "_meta" in rec:
+                meta = rec["_meta"]
+            elif "_done" in rec:
+                i = rec["_done"]
+                finished[i] = list(pending.pop(i, {}).values())
+            else:
+                key = (rec["model"], rec["thread_count"], rec["quantization"])
+                pending.setdefault(rec["image_id"], {})[key] = rec
+    return meta, finished
 
 
 # Top-level worker function for multiprocessing on Windows
-def worker_thread_placement(args_tuple: tuple[int, str, int, Sequence[float], float, float, int, list[int]]) -> tuple[int, str, int, int, dict[int, np.ndarray]]:
+def worker_thread_placement(
+    args_tuple: tuple[int, str, int, Sequence[float], float, float, int, list[int]],
+) -> tuple[int, str, int, int, dict[int, np.ndarray]]:
     idx, img_path, size, bg, thread_width, alpha, seed, counts = args_tuple
     im = load_image(img_path, size, bg)
     w, h = im.size
@@ -138,7 +346,7 @@ def worker_thread_placement(args_tuple: tuple[int, str, int, Sequence[float], fl
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run complete benchmark across 150 diverse COCO images and 5 YOLO models."
+        description="Benchmark digital filography reconstructions against each detector's own baseline."
     )
     parser.add_argument(
         "--dataset-dir",
@@ -162,7 +370,7 @@ def parse_args() -> argparse.Namespace:
         "--models",
         nargs="+",
         default=["yolov8n.pt", "yolov10n.pt", "yolo11n.pt", "yolo12n.pt", "yolo26n.pt"],
-        help="YOLO model checkpoint paths",
+        help="Model checkpoint paths (YOLO, rtdetr-*.pt, or *world*.pt)",
     )
     parser.add_argument(
         "--min-threads",
@@ -231,6 +439,12 @@ def main() -> int:
 
     total_images = len(image_files)
     thread_counts = list(range(args.min_threads, args.max_threads + 1, args.step))
+    if total_images == 0 or not thread_counts:
+        print("Error: no images found or empty thread-count grid.", file=sys.stderr)
+        return 1
+
+    summary_count = SUMMARY_THREAD_COUNT if SUMMARY_THREAD_COUNT in thread_counts else max(thread_counts)
+    model_names = [os.path.splitext(os.path.basename(mf))[0] for mf in args.models]
 
     print("================================================================================")
     print("Full-Dataset Multi-Model Digital Filography Benchmark")
@@ -243,6 +457,8 @@ def main() -> int:
     print(f"CPU Workers:      {args.workers} processes")
     print(f"Total per image:  {1 + len(thread_counts) * len(TIERS)} configs x {len(args.models)} models")
     print(f"Total inferences: {total_images * (1 + len(thread_counts) * len(TIERS)) * len(args.models):,}")
+    if SUMMARY_THREAD_COUNT not in thread_counts:
+        print(f"Warning: {SUMMARY_THREAD_COUNT} is not in the thread grid; the end summary will use N={summary_count}.")
     print("================================================================================")
 
     bg = (1.0, 1.0, 1.0)
@@ -250,14 +466,60 @@ def main() -> int:
     alpha = 1.0
     seed = 0
 
-    # 1. Load YOLO Models
-    print("\n[Phase 1/4] Initializing YOLO models and establishing model-relative baselines...")
-    models_dict: dict[str, YOLO] = {}
-    for mf in args.models:
-        mname = os.path.splitext(os.path.basename(mf))[0]
-        models_dict[mname] = YOLO(mf)
+    # --- checkpoint / resume (validated BEFORE any heavy work) ---
+    signature = {
+        "schema": SCHEMA_VERSION,
+        "models": model_names,
+        "thread_counts": thread_counts,
+        "tiers": list(TIERS),
+        "conf": args.conf,
+        "size": args.size,
+        "images": total_images,
+    }
+    ckpt_path = os.path.join(args.output_dir, "checkpoint_rows.jsonl")
+    all_filo_rows: list[dict[str, Any]] = []
+    # Accumulators for generation.csv (PSNR is identical across models)
+    gen_metrics_accum: dict[tuple[int, str], dict[str, float]] = {
+        (cnt, tier): {"psnr_sum": 0.0, "count": 0}
+        for cnt in thread_counts for tier in TIERS
+    }
+    done_images: set[int] = set()
 
-    # Dictionary to store baseline detections: baseline_dets[img_idx][model_name] = list of det dicts
+    if os.path.exists(ckpt_path):
+        stored_sig, finished = read_checkpoint(ckpt_path)
+        if stored_sig != signature:
+            print(
+                f"\nError: {ckpt_path} was written by a different run configuration or an older schema.\n"
+                "Delete the output directory (or just that file) and start again.",
+                file=sys.stderr,
+            )
+            return 1
+        expected_rows = len(thread_counts) * len(TIERS) * len(model_names)
+        for i, rows in finished.items():
+            if len(rows) != expected_rows:
+                continue  # incomplete image, redo it
+            done_images.add(i)
+            seen: set[tuple[int, str]] = set()
+            for r in rows:
+                all_filo_rows.append(r)
+                key = (r["thread_count"], r["quantization"])
+                if key not in seen:
+                    seen.add(key)
+                    g = gen_metrics_accum[key]
+                    g["psnr_sum"] += r["psnr_db"]
+                    g["count"] += 1
+        print(f"Resuming: {len(done_images)} images already completed in {ckpt_path}")
+    else:
+        with open(ckpt_path, "w", encoding="utf-8") as ck:
+            ck.write(json.dumps({"_meta": signature}) + "\n")
+
+    # 1. Load models and establish model-relative baselines
+    print("\n[Phase 1/4] Initializing models and establishing model-relative baselines...")
+    models_dict: dict[str, Any] = {}
+    for mf, mname in zip(args.models, model_names):
+        models_dict[mname] = load_model(mf)
+
+    # baseline_dets[img_idx][model_name] = list of detection dicts
     baseline_dets: dict[int, dict[str, list[dict[str, Any]]]] = {}
     baseline_rows: list[dict[str, Any]] = []
 
@@ -268,97 +530,46 @@ def main() -> int:
         baseline_dets[idx] = {}
 
         for mname, m in models_dict.items():
-            res, ms = fresh_predict(m, base_pil, device=args.device, conf=args.conf)
-            dets = []
-            all_dets_list = []
-            for b in res.boxes:
-                cid = int(b.cls[0].item())
-                cname = m.names.get(cid, str(cid)).lower()
-                c_conf = float(b.conf[0].item())
-                xyxy = [float(x) for x in b.xyxy[0].tolist()]
-                dets.append({
-                    "cls_id": cid,
-                    "cls_name": cname,
-                    "conf": c_conf,
-                    "box": xyxy,
-                })
-                all_dets_list.append(f"{cname} ({c_conf:.2f})")
-
+            res = fresh_predict(m, base_pil, device=args.device, conf=args.conf)
+            dets = extract_detections(res)
             baseline_dets[idx][mname] = dets
-            baseline_rows.append({
-                "image_id": idx,
-                "filename": fname,
-                "model": mname,
-                "image_type": "baseline_original",
-                "thread_count": 0,
-                "quantization": "none",
-                "bytes_per_thread": 0,
-                "storage_kb": 0.0,
-                "inference_time_ms": round(ms, 2),
-                "detected": len(dets) > 0,
-                "confidence": round(float(np.mean([d["conf"] for d in dets])) if dets else 0.0, 4),
-                "iou": 1.0 if dets else 0.0,
-                "mAP50": 1.0 if dets else 0.0,
-                "mAP75": 1.0 if dets else 0.0,
-                "mAP50_95": 1.0 if dets else 0.0,
-                "baseline_objects": len(dets),
-                "recovered_objects": len(dets),
-                "recovery_rate": 1.0 if dets else 0.0,
-                "psnr_db": 100.0,
-                "all_detections": ", ".join(all_dets_list) if all_dets_list else "none",
-            })
+            baseline_rows.append(build_row(
+                image_id=idx,
+                filename=fname,
+                model=mname,
+                image_type="baseline_original",
+                thread_count=0,
+                quantization="none",
+                n_base=len(dets),
+                n_pred=len(dets),
+                n_tp=len(dets),
+                mean_conf=float(np.mean([d["conf"] for d in dets])) if dets else 0.0,
+                mean_iou=1.0 if dets else 0.0,
+                psnr=None,
+                all_dets=fmt_dets(dets),
+            ))
 
         if (idx + 1) % 25 == 0 or idx == total_images - 1:
             print(f"  Established baselines for {idx + 1}/{total_images} images ({time.time() - t_base_start:.1f}s)")
 
     print(f"Baseline phase complete in {time.time() - t_base_start:.1f}s.")
 
-    # 2. Multi-Core Thread Placement and Filography Inference Pipeline
+    # 2. Multi-core thread placement and filography inference
     print(f"\n[Phase 2/4] Executing multi-core thread placement ({args.workers} workers) and evaluation...")
     worker_tasks = [
         (idx, img_path, args.size, bg, thread_width, alpha, seed, thread_counts)
         for idx, img_path in enumerate(image_files)
     ]
 
-    all_filo_rows: list[dict[str, Any]] = []
-    # Accumulators for generation.csv
-    gen_metrics_accum: dict[tuple[int, str], dict[str, float]] = {
-        (cnt, tier): {"psnr_sum": 0.0, "time_sum": 0.0, "count": 0}
-        for cnt in thread_counts for tier in TIERS
-    }
-        # --- checkpoint / resume ---
-    ckpt_path = os.path.join(args.output_dir, "checkpoint_rows.jsonl")
-    done_images: set[int] = set()
-    seen_psnr: set[tuple[int, int, str]] = set()
-    if os.path.exists(ckpt_path):
-        pending: dict[int, list[dict[str, Any]]] = {}
-        with open(ckpt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # last line may be cut off after a crash
-                if "_done" in rec:
-                    i = rec["_done"]
-                    for r in pending.pop(i, []):
-                        all_filo_rows.append(r)
-                        key = (r["image_id"], r["thread_count"], r["quantization"])
-                        if key not in seen_psnr:
-                            seen_psnr.add(key)
-                            g = gen_metrics_accum[(r["thread_count"], r["quantization"])]
-                            g["psnr_sum"] += r["psnr_db"]
-                            g["count"] += 1
-                    done_images.add(i)
-                else:
-                    pending.setdefault(rec["image_id"], []).append(rec)
-        print(f"Resuming: {len(done_images)} images already completed in {ckpt_path}")
     session_total = total_images - len(done_images)
     t_eval_start = time.time()
     completed_images = 0
 
-    # Process images with pool executor
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        future_to_idx = {executor.submit(worker_thread_placement, t): t[0] for t in worker_tasks if t[0] not in done_images}
+        future_to_idx = {
+            executor.submit(worker_thread_placement, t): t[0]
+            for t in worker_tasks if t[0] not in done_images
+        }
 
         for future in as_completed(future_to_idx):
             idx, img_path, w, h, snaps = future.result()
@@ -369,113 +580,67 @@ def main() -> int:
             base_pil = load_image(img_path, args.size, bg)
             target_norm = np.asarray(base_pil, dtype=np.float32) / 255.0
 
-            # Evaluate all thread counts and quantizations for this image
-            t_img_start = time.time()
             img_start_len = len(all_filo_rows)
             for count in thread_counts:
                 raw_threads = snaps[count]
-                flops = count * FLOP_CANDIDATES_PER_THREAD * (w * h / 1000.0)
 
                 for tier in TIERS:
                     q_threads = quantize_threads(raw_threads, tier)
                     canvas = render_threads(q_threads, w, h, bg, thread_width)
                     pixels = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
-                    filo_pil = Image.fromarray(pixels, mode="RGB")
+                    filo_pil = Image.fromarray(pixels)
 
-                    # Calculate PSNR
+                    # PSNR against the original photo (same for every model)
                     mse = float(np.mean((canvas - target_norm) ** 2))
                     psnr = round(float(-10.0 * math.log10(max(mse, 1e-10))), 2)
 
-                    storage_kb = round(count * BYTES_PER_THREAD[tier] / 1000.0, 2)
                     gen_metrics_accum[(count, tier)]["psnr_sum"] += psnr
                     gen_metrics_accum[(count, tier)]["count"] += 1
 
-                    # Evaluate across all 5 models
                     for mname, m in models_dict.items():
                         base_list = baseline_dets[idx][mname]
-                        res, ms = fresh_predict(m, filo_pil, device=args.device, conf=args.conf)
+                        res = fresh_predict(m, filo_pil, device=args.device, conf=args.conf)
+                        preds = extract_detections(res)
 
-                        pred_boxes = []
-                        all_preds_str = []
-                        for b in res.boxes:
-                            cid = int(b.cls[0].item())
-                            cname = m.names.get(cid, str(cid)).lower()
-                            c_conf = float(b.conf[0].item())
-                            xyxy = [float(x) for x in b.xyxy[0].tolist()]
-                            pred_boxes.append({"cls_name": cname, "conf": c_conf, "box": xyxy})
-                            all_preds_str.append(f"{cname} ({c_conf:.2f})")
+                        matched_ious, matched_confs = match_detections(preds, base_list)
 
-                        # Match against baseline detections
-                        matched_ious = []
-                        matched_confs = []
-                        matched_baseline_indices = set()
+                        all_filo_rows.append(build_row(
+                            image_id=idx,
+                            filename=fname,
+                            model=mname,
+                            image_type="filography",
+                            thread_count=count,
+                            quantization=tier,
+                            n_base=len(base_list),
+                            n_pred=len(preds),
+                            n_tp=len(matched_ious),
+                            mean_conf=float(np.mean(matched_confs)) if matched_confs else 0.0,
+                            mean_iou=float(np.mean(matched_ious)) if matched_ious else 0.0,
+                            psnr=psnr,
+                            all_dets=fmt_dets(preds),
+                        ))
 
-                        for pb in pred_boxes:
-                            best_iou = 0.0
-                            best_b_idx = -1
-                            for b_idx, bb in enumerate(base_list):
-                                if b_idx not in matched_baseline_indices and bb["cls_name"] == pb["cls_name"]:
-                                    cur_iou = compute_iou(pb["box"], bb["box"])
-                                    if cur_iou >= 0.50 and cur_iou > best_iou:
-                                        best_iou = cur_iou
-                                        best_b_idx = b_idx
-
-                            if best_b_idx >= 0:
-                                matched_baseline_indices.add(best_b_idx)
-                                matched_ious.append(best_iou)
-                                matched_confs.append(pb["conf"])
-
-                        if base_list:
-                            num_recovered = len(matched_baseline_indices)
-                            recovery_rate = num_recovered / len(base_list)
-                            detected = num_recovered > 0
-                        else:
-                            # Fallback if baseline had no detections: success if model detects valid objects
-                            num_recovered = len(pred_boxes)
-                            recovery_rate = 1.0 if pred_boxes else 0.0
-                            detected = len(pred_boxes) > 0
-
-                        map50, map75, map50_95 = compute_map50_95(matched_ious)
-
-                        all_filo_rows.append({
-                            "image_id": idx,
-                            "filename": fname,
-                            "model": mname,
-                            "image_type": "filography",
-                            "thread_count": count,
-                            "quantization": tier,
-                            "bytes_per_thread": BYTES_PER_THREAD[tier],
-                            "storage_kb": storage_kb,
-                            "inference_time_ms": round(ms, 2),
-                            "detected": detected,
-                            "confidence": round(float(np.mean(matched_confs)) if matched_confs else 0.0, 4),
-                            "iou": round(float(np.mean(matched_ious)) if matched_ious else 0.0, 4),
-                            "mAP50": round(map50, 4),
-                            "mAP75": round(map75, 4),
-                            "mAP50_95": round(map50_95, 4),
-                            "baseline_objects": len(base_list),
-                            "recovered_objects": num_recovered,
-                            "recovery_rate": round(recovery_rate, 4),
-                            "psnr_db": psnr,
-                            "all_detections": ", ".join(all_preds_str) if all_preds_str else "none",
-                        })
             with open(ckpt_path, "a", encoding="utf-8") as ck:
                 ck.write("".join(json.dumps(r) + "\n" for r in all_filo_rows[img_start_len:]))
                 ck.write(json.dumps({"_done": idx}) + "\n")
+
             elapsed = time.time() - t_eval_start
             rate = completed_images / max(elapsed, 1e-6)
             rem = (session_total - completed_images) / rate
             if completed_images % 5 == 0 or completed_images == session_total:
-                print(f"  Progress: {completed_images + len(done_images):3d}/{total_images} images completed ({elapsed/60.0:4.1f}m elapsed, ~{rem/60.0:4.1f}m rem)")
+                print(
+                    f"  Progress: {completed_images + len(done_images):3d}/{total_images} images completed "
+                    f"({elapsed / 60.0:4.1f}m elapsed, ~{rem / 60.0:4.1f}m rem)"
+                )
 
-    print(f"\nAll {total_images} images successfully evaluated in {(time.time() - t_eval_start)/60.0:.2f} minutes.")
+    print(f"\nAll {total_images} images successfully evaluated in {(time.time() - t_eval_start) / 60.0:.2f} minutes.")
 
-    # 3. Export Datasets & Summaries
+    # 3. Export datasets and summaries
     print("\n[Phase 3/4] Exporting benchmark CSV datasets...")
     all_rows = baseline_rows + all_filo_rows
     fieldnames = list(all_rows[0].keys())
 
-    # Master Detailed CSV
+    # Master detailed CSV
     csv_master = os.path.join(args.output_dir, "yolo_benchmark_results.csv")
     with open(csv_master, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -483,40 +648,21 @@ def main() -> int:
         writer.writerows(all_rows)
     print(f"  Saved master detailed CSV: {csv_master} ({len(all_rows):,} rows)")
 
-    # Aggregated Summary CSV across the dataset (for fast plotting & reporting)
-    summary_rows = []
-    for mname in models_dict:
+    # Aggregated summary CSV (one row per model x thread count x tier)
+    groups: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    for r in all_filo_rows:
+        groups[(r["model"], r["thread_count"], r["quantization"])].append(r)
+
+    summary_rows: list[dict[str, Any]] = []
+    summary_index: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for mname in model_names:
         for count in thread_counts:
             for tier in TIERS:
-                sub = [
-                    r for r in all_filo_rows
-                    if r["model"] == mname and r["thread_count"] == count and r["quantization"] == tier
-                ]
+                sub = groups.get((mname, count, tier))
                 if sub:
-                    det_count = sum(1 for r in sub if r["detected"])
-                    rate = det_count / len(sub)
-                    confs = [r["confidence"] for r in sub if r["detected"] and r["confidence"] > 0]
-                    ious = [r["iou"] for r in sub if r["detected"] and r["iou"] > 0]
-                    map50s = [r["mAP50"] for r in sub]
-                    map50_95s = [r["mAP50_95"] for r in sub]
-                    psnrs = [r["psnr_db"] for r in sub]
-                    latencies = [r["inference_time_ms"] for r in sub]
-
-                    summary_rows.append({
-                        "model": mname,
-                        "thread_count": count,
-                        "quantization": tier,
-                        "bytes_per_thread": BYTES_PER_THREAD[tier],
-                        "storage_kb": sub[0]["storage_kb"],
-                        "success_rate": round(rate, 4),
-                        "mean_confidence": round(float(np.mean(confs)) if confs else 0.0, 4),
-                        "mean_iou": round(float(np.mean(ious)) if ious else 0.0, 4),
-                        "mean_mAP50": round(float(np.mean(map50s)), 4),
-                        "mean_mAP50_95": round(float(np.mean(map50_95s)), 4),
-                        "mean_psnr_db": round(float(np.mean(psnrs)), 2),
-                        "mean_inference_time_ms": round(float(np.mean(latencies)), 2),
-                        "total_images_evaluated": len(sub),
-                    })
+                    row = aggregate_group(mname, count, tier, sub)
+                    summary_rows.append(row)
+                    summary_index[(mname, count, tier)] = row
 
     csv_summary = os.path.join(args.output_dir, "dataset_evaluation_summary.csv")
     with open(csv_summary, "w", newline="", encoding="utf-8") as f:
@@ -526,7 +672,7 @@ def main() -> int:
     print(f"  Saved dataset evaluation summary: {csv_summary} ({len(summary_rows):,} rows)")
 
     # Per-model detailed CSVs
-    for mname in models_dict:
+    for mname in model_names:
         m_rows = [r for r in all_rows if r["model"] == mname]
         p_csv = os.path.join(args.output_dir, f"{mname}_results.csv")
         with open(p_csv, "w", newline="", encoding="utf-8") as f:
@@ -535,32 +681,40 @@ def main() -> int:
             writer.writerows(m_rows)
         print(f"  Saved {mname} CSV: {p_csv} ({len(m_rows):,} rows)")
 
-    # Generate generation.csv across the dataset
+    # generation.csv across the dataset
     gen_rows = []
-    # Reference ranges for min-max normalization
-    all_storages = [cnt * BYTES_PER_THREAD[tier] / 1000.0 for cnt in thread_counts for tier in TIERS]
+    pixels_m = args.size * args.size * 0.75 / 1e6  # reference 4:3 canvas, in megapixels
+    flops_by_count = {c: c * FLOP_CANDIDATES_PER_THREAD * pixels_m for c in thread_counts}  # MFLOPs
+    # NOTE: generation time is a fixed linear formula (0.5 s + 0.00265 s per thread),
+    # not a value measured in this run.
+    time_by_count = {c: round(0.5 + c * 0.00265, 1) for c in thread_counts}
+
+    all_storages = [c * BYTES_PER_THREAD[t] / 1000.0 for c in thread_counts for t in TIERS]
     all_psnrs = [
         gen_metrics_accum[(c, t)]["psnr_sum"] / max(gen_metrics_accum[(c, t)]["count"], 1)
         for c in thread_counts for t in TIERS
     ]
-
     min_s, max_s = min(all_storages), max(all_storages)
     min_p, max_p = min(all_psnrs), max(all_psnrs)
+    min_f, max_f = min(flops_by_count.values()), max(flops_by_count.values())
+    min_t, max_t = min(time_by_count.values()), max(time_by_count.values())
 
     for count in thread_counts:
-        flops = count * FLOP_CANDIDATES_PER_THREAD * (640 * 480 / 1e6)
-        flops_str = f"{flops/1000.0:.2f} GFLOPs" if flops >= 1000 else f"{flops:.1f} MFLOPs"
+        flops = flops_by_count[count]
+        flops_str = f"{flops / 1000.0:.2f} GFLOPs" if flops >= 1000 else f"{flops:.1f} MFLOPs"
+        gen_time_s = time_by_count[count]
 
         for tier in TIERS:
             st_kb = count * BYTES_PER_THREAD[tier] / 1000.0
-            avg_psnr = round(gen_metrics_accum[(count, tier)]["psnr_sum"] / max(gen_metrics_accum[(count, tier)]["count"], 1), 2)
-            gen_time_s = round(0.5 + (count / 10000.0) * 26.5, 1)
+            avg_psnr = round(
+                gen_metrics_accum[(count, tier)]["psnr_sum"] / max(gen_metrics_accum[(count, tier)]["count"], 1), 2
+            )
 
-            # Norm score (0 to 100)
+            # Min-max normalized scores in [0, 1], higher is better
             score_s = (max_s - st_kb) / max(max_s - min_s, 1e-6)
             score_p = (avg_psnr - min_p) / max(max_p - min_p, 1e-6)
-            score_t = (27.0 - gen_time_s) / 27.0
-            score_f = (4.3 - (flops / 1000.0)) / 4.3
+            score_t = (max_t - gen_time_s) / max(max_t - min_t, 1e-6)
+            score_f = (max_f - flops) / max(max_f - min_f, 1e-6)
 
             avg_1 = round(100.0 * (score_s + score_t + score_f + score_p) / 4.0, 2)
             avg_2 = round(100.0 * (score_s + score_t + score_f + 2.0 * score_p) / 5.0, 2)
@@ -570,13 +724,13 @@ def main() -> int:
                 "Thread Count (N)": count,
                 "Precision Tier": tier,
                 "Bytes / Thread": f"{BYTES_PER_THREAD[tier]} B",
-                "Storage (KB) ↓": f"{st_kb:.2f} KB",
-                "Generation Time ↓": f"{gen_time_s:.1f} s",
-                "Total Operations (FLOPs) ↓": flops_str,
-                "PSNR (vs Original) ↑": f"{avg_psnr:.2f} dB",
-                "Average (1:1:1:1) ↑": avg_1,
-                "Average (1:1:1:2) ↑": avg_2,
-                "Average (1:1:1:3) ↑": avg_3,
+                "Storage (KB) \u2193": f"{st_kb:.2f} KB",
+                "Generation Time \u2193": f"{gen_time_s:.1f} s",
+                "Total Operations (FLOPs) \u2193": flops_str,
+                "PSNR (vs Original) \u2191": f"{avg_psnr:.2f} dB",
+                "Average (1:1:1:1) \u2191": avg_1,
+                "Average (1:1:1:2) \u2191": avg_2,
+                "Average (1:1:1:3) \u2191": avg_3,
             })
 
     csv_gen = os.path.join(args.output_dir, "generation.csv")
@@ -586,7 +740,7 @@ def main() -> int:
         writer.writerows(gen_rows)
     print(f"  Saved dataset generation metrics: {csv_gen} ({len(gen_rows)} rows)")
 
-    # 4. Regenerate Graphs
+    # 4. Regenerate graphs
     print("\n[Phase 4/4] Regenerating publication-quality graphs for the full dataset...")
     graph_cmd = [
         sys.executable,
@@ -597,36 +751,43 @@ def main() -> int:
         "--dpi", "300",
         "--formats", "png", "svg",
     ]
-    subprocess.run(graph_cmd, check=True)
+    rc = subprocess.run(graph_cmd).returncode
+    if rc != 0:
+        print(f"\nWarning: graph generation exited with code {rc}. CSVs are saved. Re-run with:")
+        print("  " + " ".join(f'"{c}"' if " " in c else c for c in graph_cmd))
 
-    # 5. Print Concise Summary
+    # 5. Concise console summary
     print("\n" + "=" * 90)
-    print("DATASET BENCHMARK RESULTS SUMMARY (Empirical Reliability across 150 COCO Images):")
+    print(f"DATASET BENCHMARK RESULTS SUMMARY (Model-relative recovery across {total_images} COCO images):")
     print("=" * 90)
-    for mname in models_dict:
+    for mname in model_names:
         print(f"\n--- Architecture: {mname} ---")
         for tier in TIERS:
-            tier_rows = [r for r in summary_rows if r["model"] == mname and r["quantization"] == tier]
-            if tier_rows:
-                # Find first count reaching >= 50% detection success rate
-                hits_50 = [r for r in tier_rows if r["success_rate"] >= 0.50]
-                hits_any = [r for r in tier_rows if r["success_rate"] > 0.0]
-                if hits_50:
-                    first_50 = min(hits_50, key=lambda x: x["thread_count"])
-                    final_10k = [r for r in tier_rows if r["thread_count"] == 10000][0]
-                    print(
-                        f"  {tier:8s}: Reliable (>=50%) at {first_50['thread_count']:5d} threads | "
-                        f"Rate: {first_50['success_rate']*100:.1f}% | "
-                        f"10k Rate: {final_10k['success_rate']*100:.1f}% (Conf: {final_10k['mean_confidence']:.2f}, IoU: {final_10k['mean_iou']:.2f})"
-                    )
-                elif hits_any:
-                    first_any = min(hits_any, key=lambda x: x["thread_count"])
-                    print(
-                        f"  {tier:8s}: First detection at {first_any['thread_count']:5d} threads | "
-                        f"Peak Rate: {max(r['success_rate'] for r in tier_rows)*100:.1f}%"
-                    )
-                else:
-                    print(f"  {tier:8s}: Zero detections across all 10,000 threads (Quantization Breakdown)")
+            tier_rows = sorted(
+                (r for r in summary_rows if r["model"] == mname and r["quantization"] == tier),
+                key=lambda r: r["thread_count"],
+            )
+            if not tier_rows:
+                continue
+            final = summary_index.get((mname, summary_count, tier))
+            final_txt = (
+                f"N={summary_count}: recovery {pct(final['recovery_rate'])}, "
+                f"precision {pct(final['precision'])}, F1 {pct(final['f1'])}"
+                if final else f"N={summary_count}: no data"
+            )
+            hits = [r for r in tier_rows if (r["recovery_rate"] or 0.0) >= RELIABLE_RECOVERY]
+            if hits:
+                first = hits[0]
+                print(
+                    f"  {tier:8s}: >=50% recovery first at N={first['thread_count']:5d} "
+                    f"(precision {pct(first['precision'])}) | {final_txt}"
+                )
+            else:
+                best = max(tier_rows, key=lambda r: r["recovery_rate"] or 0.0)
+                print(
+                    f"  {tier:8s}: never reached 50% recovery "
+                    f"(peak {pct(best['recovery_rate'])} at N={best['thread_count']}) | {final_txt}"
+                )
 
     print("\n================================================================================")
     print("Full-Dataset Benchmark & Visualizations Completed Successfully!")

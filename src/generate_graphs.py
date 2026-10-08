@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""generate_graphs.py: Publication-quality graph generator for Digital Filography & YOLO Benchmarks.
+"""generate_graphs.py: Publication-quality graph generator for Digital Filography benchmarks.
 
-Generates comprehensive, aesthetic, model-relative figures saved into graphs/:
-1. Figure 1: Model-Relative Detection Recovery Rate vs. Thread Count (2x2 grid by quantization tier)
-2. Figure 2: First Successful Detection Recovery Threshold (Grouped bar chart & architectural ranking)
-3. Figure 3: Confidence & Localization IoU Trajectories of Recovered Objects (Dual panel)
-4. Figure 4: Effect of Bit-Width (Quantization Frontier & Recovery Breakdown)
-5. Figure 5: Pareto Storage Overhead vs. Recovered Detection Confidence
-6. Figure 6: Visual Fidelity (Mean PSNR vs. Thread Count & Storage)
-7. Figure 7: Hardware Latency Distribution Across Architectures (RTX 4060 GPU)
-8. Appendix 1: Model-Relative Recovery Confidence Heatmaps (float16 & uint8)
-9. Appendix 2: Model-Relative Precision Dynamics (mAP@0.50 & mAP@0.50:0.95)
+All figures are model-relative: a model's detections on the uncompressed photo
+are the baseline, and the metrics describe how much of that survives.
+
+  recovery_rate : matched baseline objects / baseline objects
+  precision     : matched baseline objects / predicted objects (extra detections hurt)
+  f1            : harmonic mean of the two
+
+Figures written to the graphs directory:
+1. Figure 1: Recovery rate vs. thread count (one panel per precision tier)
+2. Figure 2: Minimum thread count for >=50% recovery (grouped bars)
+3. Figure 3: Confidence and IoU of recovered (matched) detections
+4. Figure 4: Effect of bit-width (threshold, plus recovery/precision at max N)
+5. Figure 5: Storage vs. recovery (Pareto frontier)
+6. Figure 6: Visual fidelity (PSNR vs. thread count)
+7. Figure 7: Precision vs. thread count (one panel per precision tier)
+8. Appendix 1: Recovery-rate heatmaps (model x thread count)
+9. Appendix 2: F1 vs. thread count (one panel per precision tier)
+
+Not plotted on purpose: mAP (the old columns were not real mAP) and inference
+time (workers competed for CPU/GPU, so timings were not meaningful).
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -26,6 +37,7 @@ import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.lines import Line2D
 
 # Global style configuration
 plt.rcParams.update({
@@ -49,13 +61,16 @@ plt.rcParams.update({
     "grid.alpha": 0.8,
 })
 
-# Harmonious palettes
+MODEL_ORDER = ["yolov8n", "yolov10n", "yolo11n", "yolo12n", "yolo26n", "rtdetr-l", "yolov8s-worldv2"]
+
 MODEL_COLORS = {
-    "yolov8n": "#1f77b4",   # Classic Blue
-    "yolov10n": "#ff7f0e",  # Amber Orange
-    "yolo11n": "#2ca02c",   # Emerald Green
-    "yolo12n": "#d62728",   # Crimson Red
-    "yolo26n": "#9467bd",   # Royal Purple
+    "yolov8n": "#1f77b4",          # Classic Blue
+    "yolov10n": "#ff7f0e",         # Amber Orange
+    "yolo11n": "#2ca02c",          # Emerald Green
+    "yolo12n": "#d62728",          # Crimson Red
+    "yolo26n": "#9467bd",          # Royal Purple
+    "rtdetr-l": "#17becf",         # Teal
+    "yolov8s-worldv2": "#8c564b",  # Brown
 }
 
 MODEL_LABELS = {
@@ -64,8 +79,12 @@ MODEL_LABELS = {
     "yolo11n": "YOLO11n",
     "yolo12n": "YOLO12n",
     "yolo26n": "YOLO26n",
+    "rtdetr-l": "RT-DETR-L",
+    "yolov8s-worldv2": "YOLOv8s-WorldV2",
 }
 
+TIER_ORDER = ["float32", "float16", "uint8", "uint6", "uint5", "uint4"]
+TIER_BITS = {"float32": 32, "float16": 16, "uint8": 8, "uint6": 6, "uint5": 5, "uint4": 4}
 TIER_COLORS = {
     "float32": "#7f8c8d",
     "float16": "#2980b9",
@@ -74,8 +93,12 @@ TIER_COLORS = {
     "uint5": "#d35400",
     "uint4": "#c0392b",
 }
+RECOVERY_LEVEL = 0.50
 
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def save_figure(fig: plt.Figure, base_path: str, formats: Sequence[str], dpi: int = 300) -> None:
     """Save figure in specified formats with clean bounding box."""
     for fmt in formats:
@@ -85,89 +108,70 @@ def save_figure(fig: plt.Figure, base_path: str, formats: Sequence[str], dpi: in
     plt.close(fig)
 
 
+def present_models(df: pd.DataFrame) -> list[str]:
+    seen = set(df["model"].unique())
+    return [m for m in MODEL_ORDER if m in seen] + sorted(seen - set(MODEL_ORDER))
+
+
+def present_tiers(df: pd.DataFrame) -> list[str]:
+    seen = set(df["quantization"].unique())
+    return [t for t in TIER_ORDER if t in seen] + sorted(seen - set(TIER_ORDER))
+
+
+def model_color(m: str) -> str:
+    if m in MODEL_COLORS:
+        return MODEL_COLORS[m]
+    return plt.get_cmap("tab20")(sum(ord(c) for c in m) % 20)
+
+
+def model_label(m: str) -> str:
+    return MODEL_LABELS.get(m, m)
+
+
+def tier_color(t: str) -> str:
+    return TIER_COLORS.get(t, "#555555")
+
+
+def first_threshold(sub: pd.DataFrame, level: float = RECOVERY_LEVEL) -> int | None:
+    """Smallest thread count whose recovery rate is >= level, or None if never reached."""
+    hits = sub[sub["recovery_rate"] >= level]
+    return int(hits["thread_count"].min()) if not hits.empty else None
+
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
 def load_clean_data(bench_path: str, gen_path: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """Load and clean benchmark and generation datasets."""
-    df_bench = pd.read_csv(bench_path, encoding="utf-8")
-    if "image_type" in df_bench.columns:
-        df_filo = df_bench[df_bench["image_type"] == "filography"].copy()
-    else:
-        df_filo = df_bench.copy()
+    """Load the summary CSV (one row per model x thread count x tier) and generation metrics."""
+    df = pd.read_csv(bench_path, encoding="utf-8")
+    if "image_type" in df.columns:
+        df = df[df["image_type"] == "filography"].copy()
 
-    # Normalize recovery / success rate
-    if "success_rate" in df_filo.columns:
-        df_filo["success_rate_pct"] = pd.to_numeric(df_filo["success_rate"], errors="coerce").fillna(0.0) * 100.0
-        df_filo["target_detected"] = df_filo["success_rate_pct"] > 0.0
-    elif "recovery_rate" in df_filo.columns:
-        df_filo["success_rate_pct"] = pd.to_numeric(df_filo["recovery_rate"], errors="coerce").fillna(0.0) * 100.0
-        df_filo["target_detected"] = df_filo["success_rate_pct"] > 0.0
-    elif "detected" in df_filo.columns:
-        df_filo["target_detected"] = df_filo["detected"].astype(bool)
-        df_filo["success_rate_pct"] = df_filo["target_detected"].astype(float) * 100.0
-    elif "cat_detected" in df_filo.columns:
-        df_filo["target_detected"] = df_filo["cat_detected"].astype(bool)
-        df_filo["success_rate_pct"] = df_filo["target_detected"].astype(float) * 100.0
-    else:
-        df_filo["target_detected"] = False
-        df_filo["success_rate_pct"] = 0.0
+    required = ["model", "thread_count", "quantization", "storage_kb", "recovery_rate", "precision", "f1"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"Error: {bench_path} is missing columns {missing}.\n"
+            "It looks like a summary CSV from the old schema (success_rate, mean_mAP50, ...). "
+            "Re-run eval_dataset.py to regenerate it."
+        )
 
-    df_filo["cat_detected"] = df_filo["target_detected"]
-
-    # Normalize confidence & IoU
-    if "mean_confidence" in df_filo.columns:
-        df_filo["confidence"] = pd.to_numeric(df_filo["mean_confidence"], errors="coerce").fillna(0.0)
-    elif "confidence" in df_filo.columns:
-        df_filo["confidence"] = pd.to_numeric(df_filo["confidence"], errors="coerce").fillna(0.0)
-    elif "cat_confidence" in df_filo.columns:
-        df_filo["confidence"] = pd.to_numeric(df_filo["cat_confidence"], errors="coerce").fillna(0.0)
-    else:
-        df_filo["confidence"] = 0.0
-
-    df_filo["cat_confidence"] = df_filo["confidence"]
-
-    if "mean_iou" in df_filo.columns:
-        df_filo["iou"] = pd.to_numeric(df_filo["mean_iou"], errors="coerce").fillna(0.0)
-    elif "iou" in df_filo.columns:
-        df_filo["iou"] = pd.to_numeric(df_filo["iou"], errors="coerce").fillna(0.0)
-    elif "cat_iou" in df_filo.columns:
-        df_filo["iou"] = pd.to_numeric(df_filo["cat_iou"], errors="coerce").fillna(0.0)
-    else:
-        df_filo["iou"] = 0.0
-
-    df_filo["cat_iou"] = df_filo["iou"]
-
-    # Normalize mAP
-    if "mean_mAP50" in df_filo.columns:
-        df_filo["mAP50"] = pd.to_numeric(df_filo["mean_mAP50"], errors="coerce").fillna(0.0)
-    elif "mAP50" in df_filo.columns:
-        df_filo["mAP50"] = pd.to_numeric(df_filo["mAP50"], errors="coerce").fillna(0.0)
-    else:
-        df_filo["mAP50"] = 0.0
-
-    if "mean_mAP50_95" in df_filo.columns:
-        df_filo["mAP50_95"] = pd.to_numeric(df_filo["mean_mAP50_95"], errors="coerce").fillna(0.0)
-    elif "mAP50_95" in df_filo.columns:
-        df_filo["mAP50_95"] = pd.to_numeric(df_filo["mAP50_95"], errors="coerce").fillna(0.0)
-    else:
-        df_filo["mAP50_95"] = 0.0
-
-    if "mean_inference_time_ms" in df_filo.columns:
-        df_filo["inference_time_ms"] = pd.to_numeric(df_filo["mean_inference_time_ms"], errors="coerce").fillna(0.0)
-    elif "inference_time_ms" in df_filo.columns:
-        df_filo["inference_time_ms"] = pd.to_numeric(df_filo["inference_time_ms"], errors="coerce").fillna(0.0)
-
-    df_filo["thread_count"] = pd.to_numeric(df_filo["thread_count"], errors="coerce").astype(int)
-    df_filo["storage_kb"] = pd.to_numeric(df_filo["storage_kb"], errors="coerce").fillna(0.0)
+    for c in ["recovery_rate", "precision", "f1", "mean_confidence", "mean_iou", "storage_kb", "mean_psnr_db"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")  # blanks stay NaN, they are not zeros
+    df["confidence"] = df["mean_confidence"] if "mean_confidence" in df.columns else np.nan
+    df["iou"] = df["mean_iou"] if "mean_iou" in df.columns else np.nan
+    df["thread_count"] = pd.to_numeric(df["thread_count"], errors="coerce").astype(int)
+    df["quantization"] = df["quantization"].astype(str).str.strip()
 
     df_gen = None
     if gen_path and os.path.exists(gen_path):
         df_gen_raw = pd.read_csv(gen_path, encoding="utf-8")
-        clean_cols = {}
-        for c in df_gen_raw.columns:
-            clean_c = c.replace("↓", "").replace("↑", "").strip()
-            clean_cols[c] = clean_c
-        df_gen = df_gen_raw.rename(columns=clean_cols).copy()
+        df_gen = df_gen_raw.rename(
+            columns={c: c.replace("\u2193", "").replace("\u2191", "").strip() for c in df_gen_raw.columns}
+        ).copy()
 
-        def parse_num(val: str) -> float:
+        def parse_num(val: object) -> float:
             if pd.isna(val):
                 return 0.0
             clean = re.sub(r"[^\d.-]", "", str(val))
@@ -187,31 +191,49 @@ def load_clean_data(bench_path: str, gen_path: str | None = None) -> tuple[pd.Da
         if "Precision Tier" in df_gen.columns:
             df_gen["quantization"] = df_gen["Precision Tier"].str.strip()
 
-    return df_filo, df_gen
+    return df, df_gen
 
 
 # -----------------------------------------------------------------------------
-# Figure 1: Model-Relative Detection Recovery Rate vs Thread Count (2x2 Grid)
+# Generic: metric vs thread count, one panel per tier
 # -----------------------------------------------------------------------------
-def plot_figure_1(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[1/9] Generating Figure 1: Model-Relative Detection Recovery vs Thread Count...")
-    tiers = ["float16", "uint8", "uint6", "uint4"]
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True, sharey=True)
+def plot_metric_by_tier(
+    df: pd.DataFrame,
+    metric: str,
+    metric_name: str,
+    title: str,
+    basename: str,
+    out_dir: str,
+    formats: Sequence[str],
+    dpi: int,
+    step_msg: str,
+) -> None:
+    print(step_msg)
+    tiers = present_tiers(df)
+    models = present_models(df)
+    ncols = 2 if len(tiers) > 1 else 1
+    nrows = math.ceil(len(tiers) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.2 * ncols, 4.8 * nrows), sharex=True, sharey=True, squeeze=False)
     axes_flat = axes.flatten()
 
-    for idx, tier in enumerate(tiers):
-        ax = axes_flat[idx]
+    for ax in axes_flat[len(tiers):]:
+        ax.set_visible(False)
+
+    for i, (ax, tier) in enumerate(zip(axes_flat, tiers)):
+        if i + ncols >= len(tiers):
+            # No visible panel below this one (odd panel count), so keep its x tick labels.
+            ax.tick_params(labelbottom=True)
         sub = df[df["quantization"] == tier]
-        for model in ["yolov8n", "yolov10n", "yolo11n", "yolo12n", "yolo26n"]:
+        for model in models:
             m_sub = sub[sub["model"] == model].sort_values("thread_count")
             ax.plot(
                 m_sub["thread_count"],
-                m_sub["success_rate_pct"],
-                label=MODEL_LABELS.get(model, model),
-                color=MODEL_COLORS.get(model, "#333333"),
-                linewidth=2.2,
+                m_sub[metric] * 100.0,
+                label=model_label(model),
+                color=model_color(model),
+                linewidth=2.0,
                 marker="o",
-                markersize=3.5,
+                markersize=3.0,
                 alpha=0.9,
             )
 
@@ -220,239 +242,264 @@ def plot_figure_1(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: i
         ax.yaxis.set_major_formatter(ticker.PercentFormatter(100))
         ax.grid(True)
 
-        if tier in ["uint6", "uint4"]:
+        # Data-driven note: only shown if this tier really is zero everywhere.
+        vals = sub[metric].dropna()
+        if vals.empty or vals.max() <= 0:
             ax.text(
-                0.5, 0.5, "Zero Baseline Detections Recovered Across All 10,000 Threads\n(Sub-8-Bit Quantization Step Noise Collapse)",
+                0.5, 0.5, f"{metric_name} is 0 at every\nthread count for this tier",
                 transform=ax.transAxes, ha="center", va="center",
                 fontsize=11, fontweight="bold", color="#c0392b",
-                bbox=dict(boxstyle="round,pad=0.5", facecolor="#fadbd8", edgecolor="#e74c3c", alpha=0.9)
+                bbox=dict(boxstyle="round,pad=0.5", facecolor="#fadbd8", edgecolor="#e74c3c", alpha=0.9),
             )
 
-    fig.text(0.5, 0.04, "Thread Count (N)", ha="center", fontsize=12, fontweight="bold")
-    fig.text(0.04, 0.5, "Model-Relative Object Recovery Rate (%)", va="center", rotation="vertical", fontsize=12, fontweight="bold")
+    fig.supxlabel("Thread Count (N)", fontweight="bold")
+    fig.supylabel(f"{metric_name} (%)", fontweight="bold")
 
     handles, labels = axes_flat[0].get_legend_handles_labels()
     fig.legend(
-        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98),
-        ncol=5, frameon=True, facecolor="white", edgecolor="#cccccc"
+        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.945),
+        ncol=min(len(models), 7), frameon=True, facecolor="white", edgecolor="#cccccc", fontsize=9,
     )
-
-    fig.suptitle("Figure 1: Model-Relative Detection Recovery Rate Across Thread Counts and Quantization Tiers", y=1.02)
-    plt.tight_layout(rect=[0.05, 0.05, 0.98, 0.95])
-    save_figure(fig, os.path.join(out_dir, "fig1_detection_success_vs_threads"), formats, dpi)
+    fig.suptitle(title, y=0.995)
+    plt.tight_layout(rect=(0.03, 0.03, 1, 0.90))
+    save_figure(fig, os.path.join(out_dir, basename), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Figure 2: First Successful Detection Recovery Threshold (Grouped Bar Chart)
+# Figure 1: Recovery rate vs thread count
+# -----------------------------------------------------------------------------
+def plot_figure_1(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
+    plot_metric_by_tier(
+        df, "recovery_rate", "Object Recovery Rate",
+        "Figure 1: Model-Relative Object Recovery Rate Across Thread Counts and Quantization Tiers",
+        "fig1_detection_success_vs_threads", out_dir, formats, dpi,
+        "[1/9] Generating Figure 1: Model-Relative Recovery vs Thread Count...",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Figure 2: Minimum thread count for >=50% recovery
 # -----------------------------------------------------------------------------
 def plot_figure_2(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[2/9] Generating Figure 2: First Successful Detection Recovery Threshold...")
-    models = ["yolov8n", "yolo12n", "yolo11n", "yolov10n", "yolo26n"]
-    thresholds: dict[str, dict[str, int | None]] = {m: {"float16": None, "uint8": None} for m in models}
+    print("[2/9] Generating Figure 2: Recovery Threshold...")
+    models = present_models(df)
+    tiers = present_tiers(df)
 
-    for m in models:
-        for t in ["float16", "uint8"]:
-            sub_mt = df[(df["model"] == m) & (df["quantization"] == t)]
-            hits_50 = sub_mt[sub_mt["success_rate_pct"] >= 50.0]
-            hits_any = sub_mt[sub_mt["success_rate_pct"] > 0.0]
-            if not hits_50.empty:
-                thresholds[m][t] = int(hits_50["thread_count"].min())
-            elif not hits_any.empty:
-                thresholds[m][t] = int(hits_any["thread_count"].min())
+    thresholds: dict[str, dict[str, int | None]] = {
+        m: {t: first_threshold(df[(df["model"] == m) & (df["quantization"] == t)]) for t in tiers}
+        for m in models
+    }
 
     x = np.arange(len(models))
-    width = 0.36
+    width = 0.8 / max(len(tiers), 1)
+    fig, ax = plt.subplots(figsize=(max(10, 1.5 * len(models) + 3), 6.5))
 
-    fig, ax = plt.subplots(figsize=(10, 6.5))
-    vals_f16 = [thresholds[m]["float16"] or 0 for m in models]
-    vals_u8 = [thresholds[m]["uint8"] or 0 for m in models]
+    all_vals = [v for m in models for v in thresholds[m].values() if v]
+    top = max(all_vals) if all_vals else 1000
+    ax.set_ylim(0, top * 1.35)
 
-    b1 = ax.bar(x - width / 2, vals_f16, width, label="float16 (16-bit)", color="#2980b9", edgecolor="#1a5276", linewidth=1.2)
-    b2 = ax.bar(x + width / 2, vals_u8, width, label="uint8 (8-bit)", color="#27ae60", edgecolor="#196f3d", linewidth=1.2)
-
-    for bar, val in zip(b1, vals_f16):
-        if val > 0:
-            ax.annotate(f"{val:,}", xy=(bar.get_x() + bar.get_width() / 2, val), xytext=(0, 4),
-                        textcoords="offset points", ha="center", va="bottom", fontsize=10, fontweight="bold", color="#1a5276")
-
-    for bar, val in zip(b2, vals_u8):
-        if val > 0:
-            ax.annotate(f"{val:,}", xy=(bar.get_x() + bar.get_width() / 2, val), xytext=(0, 4),
-                        textcoords="offset points", ha="center", va="bottom", fontsize=10, fontweight="bold", color="#196f3d")
+    for i, tier in enumerate(tiers):
+        offset = (i - (len(tiers) - 1) / 2) * width
+        vals = [thresholds[m][tier] or 0 for m in models]
+        bars = ax.bar(x + offset, vals, width, label=f"{tier} ({TIER_BITS.get(tier, '?')}-bit)",
+                      color=tier_color(tier), edgecolor="#2c3e50", linewidth=1.0)
+        for bar, val in zip(bars, vals):
+            label = f"{val:,}" if val else "never"
+            ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, val), xytext=(0, 4),
+                        textcoords="offset points", ha="center", va="bottom", fontsize=9,
+                        fontweight="bold", color="#2c3e50")
 
     ax.set_xticks(x)
-    ax.set_xticklabels([MODEL_LABELS[m] for m in models], fontsize=11, fontweight="bold")
-    ax.set_ylabel("Minimum Thread Count for ≥50% Baseline Object Recovery", fontsize=11, fontweight="bold")
-    max_val = max(max(vals_f16), max(vals_u8), 5000)
-    ax.set_ylim(0, max_val * 1.25)
+    ax.set_xticklabels([model_label(m) for m in models], fontsize=10, fontweight="bold", rotation=15)
+    ax.set_ylabel("Minimum Thread Count for >=50% Baseline Object Recovery", fontsize=11, fontweight="bold")
     ax.grid(True, axis="y")
 
-    # Dynamic ranking annotation
-    ranked = sorted([(m, thresholds[m]["float16"] or 99999) for m in models], key=lambda t: t[1])
-    rank_str = " > ".join([f"{MODEL_LABELS[m]} ({th:,})" if th < 99999 else f"{MODEL_LABELS[m]} (N/A)" for m, th in ranked])
+    # Dynamic ranking for the highest-precision tier present
+    rank_tier = tiers[0] if tiers else None
+    if rank_tier:
+        ranked = sorted(models, key=lambda m: (thresholds[m][rank_tier] is None, thresholds[m][rank_tier] or 0))
+        rank_str = " < ".join(
+            f"{model_label(m)} ({thresholds[m][rank_tier]:,})" if thresholds[m][rank_tier] else f"{model_label(m)} (never)"
+            for m in ranked
+        )
+        ax.text(
+            0.5, 0.95, f"Fewest threads to reach 50% recovery ({rank_tier}):\n{rank_str}",
+            transform=ax.transAxes, ha="center", va="top", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="#fef9e7", edgecolor="#f39c12", alpha=0.95),
+        )
 
-    ax.text(
-        0.5, 0.88,
-        f"Model Recovery Ranking (float16):\n{rank_str}\n"
-        "*Note: uint6 (6-bit) and uint4 (4-bit) never recovered baseline objects across 10,000 threads.*",
-        transform=ax.transAxes, ha="center", va="center", fontsize=9.5,
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#fef9e7", edgecolor="#f39c12", alpha=0.95)
-    )
-
-    ax.legend(loc="upper left", frameon=True, facecolor="white", edgecolor="#cccccc")
-    ax.set_title("Figure 2: Minimum Thread Count for Reliable Detection Recovery (≥50% Baseline Match)", pad=12)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=max(len(tiers), 1),
+              frameon=True, facecolor="white", edgecolor="#cccccc")
+    ax.set_title("Figure 2: Minimum Thread Count for Reliable Recovery (>=50% of Baseline Objects)", pad=12)
     plt.tight_layout()
     save_figure(fig, os.path.join(out_dir, "fig2_first_detection_threshold"), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Figure 3: Confidence & Localization IoU of Recovered Baseline Objects
+# Figure 3: Confidence and IoU of recovered detections
 # -----------------------------------------------------------------------------
 def plot_figure_3(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
     print("[3/9] Generating Figure 3: Confidence & Localization IoU Trajectories...")
-    df_detected = df[df["target_detected"] & (df["quantization"].isin(["float16", "uint8"]))].copy()
+    models = present_models(df)
+    tiers = [t for t in ("float16", "uint8") if t in set(df["quantization"])]
+    styles = {"float16": "-", "uint8": "--"}
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
 
-    for model in ["yolov8n", "yolov10n", "yolo11n", "yolo12n", "yolo26n"]:
-        col = MODEL_COLORS.get(model, "#333333")
-        label = MODEL_LABELS.get(model, model)
-        m_f16 = df_detected[(df_detected["model"] == model) & (df_detected["quantization"] == "float16")].sort_values("thread_count")
-        m_u8 = df_detected[(df_detected["model"] == model) & (df_detected["quantization"] == "uint8")].sort_values("thread_count")
-
-        if not m_f16.empty:
-            ax1.plot(m_f16["thread_count"], m_f16["confidence"], label=f"{label} (float16)", color=col, linewidth=2.0)
-            ax2.plot(m_f16["thread_count"], m_f16["iou"], label=f"{label} (float16)", color=col, linewidth=2.0)
-
-        if not m_u8.empty:
-            ax1.plot(m_u8["thread_count"], m_u8["confidence"], label=f"{label} (uint8)", color=col, linestyle="--", linewidth=1.7, alpha=0.85)
-            ax2.plot(m_u8["thread_count"], m_u8["iou"], label=f"{label} (uint8)", color=col, linestyle="--", linewidth=1.7, alpha=0.85)
+    for model in models:
+        for tier in tiers:
+            m_sub = df[(df["model"] == model) & (df["quantization"] == tier)].sort_values("thread_count")
+            ax1.plot(m_sub["thread_count"], m_sub["confidence"], color=model_color(model),
+                     linestyle=styles[tier], linewidth=1.9, alpha=0.9)
+            ax2.plot(m_sub["thread_count"], m_sub["iou"], color=model_color(model),
+                     linestyle=styles[tier], linewidth=1.9, alpha=0.9)
 
     ax1.set_ylabel("Mean Confidence of Recovered Detections", fontweight="bold")
-    ax1.set_ylim(0.2, 1.0)
+    ax1.set_ylim(0.0, 1.02)
     ax1.grid(True)
-    ax1.set_title("A. Recovered Baseline Object Detection Confidence Progression", loc="left", fontsize=11, fontweight="bold")
+    ax1.set_title("A. Confidence of Recovered Baseline Objects (gaps = nothing recovered)", loc="left", fontsize=11, fontweight="bold")
 
     ax2.set_ylabel("Mean Bounding Box IoU vs. Baseline", fontweight="bold")
     ax2.set_xlabel("Thread Count (N)", fontweight="bold")
     ax2.set_ylim(0.50, 1.005)
     ax2.grid(True)
-    ax2.set_title("B. Bounding Box Localization Fidelity (IoU vs. Uncompressed Original Baseline)", loc="left", fontsize=11, fontweight="bold")
+    ax2.set_title("B. Localization of Recovered Objects (IoU >= 0.50 by definition of a match)", loc="left", fontsize=11, fontweight="bold")
 
-    handles, labels = ax1.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=5, frameon=True, facecolor="white", edgecolor="#cccccc", fontsize=9)
+    handles = [Line2D([0], [0], color=model_color(m), lw=2.2, label=model_label(m)) for m in models]
+    handles += [Line2D([0], [0], color="#444444", lw=2.0, linestyle=styles[t], label=t) for t in tiers]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.97), ncol=5,
+               frameon=True, facecolor="white", edgecolor="#cccccc", fontsize=9)
 
-    fig.suptitle("Figure 3: Confidence and Localization IoU Dynamics of Recovered Baseline Objects", y=1.02)
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.suptitle("Figure 3: Confidence and Localization of Recovered Baseline Objects", y=1.01)
+    plt.tight_layout(rect=(0, 0, 1, 0.92))
     save_figure(fig, os.path.join(out_dir, "fig3_confidence_and_iou_trajectory"), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Figure 4: Effect of Bit-Width (Quantization Frontier)
+# Figure 4: Effect of bit-width
 # -----------------------------------------------------------------------------
 def plot_figure_4(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
     print("[4/9] Generating Figure 4: Effect of Bit-Width...")
-    models = ["yolov8n", "yolov10n", "yolo11n", "yolo12n", "yolo26n"]
-    tiers = ["float16", "uint8", "uint6", "uint4"]
-    bit_widths = [16, 8, 6, 4]
+    models = present_models(df)
+    tiers = present_tiers(df)
+    bit_widths = [TIER_BITS.get(t, 0) for t in tiers]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Panel A: Minimum threads needed vs Bit-Width
+    # Panel A: threads needed for >=50% recovery vs bit-width
     for m in models:
-        req_threads = []
-        valid_bits = []
+        xs, ys = [], []
         for t, b in zip(tiers, bit_widths):
-            hits = df[(df["model"] == m) & (df["quantization"] == t) & (df["target_detected"])]
-            if not hits.empty:
-                req_threads.append(hits["thread_count"].min())
-                valid_bits.append(b)
-        if req_threads:
-            ax1.plot(valid_bits, req_threads, marker="o", linewidth=2.2, label=MODEL_LABELS[m], color=MODEL_COLORS[m])
+            th = first_threshold(df[(df["model"] == m) & (df["quantization"] == t)])
+            if th is not None:
+                xs.append(b)
+                ys.append(th)
+        if xs:
+            ax1.plot(xs, ys, marker="o", linewidth=2.0, label=model_label(m), color=model_color(m))
 
     ax1.set_xlabel("Quantization Bit-Width (bits / thread attribute)", fontweight="bold")
-    ax1.set_ylabel("Minimum Thread Count for Baseline Recovery", fontweight="bold")
-    ax1.set_title("A. Recovery Thread Threshold vs. Quantization Bit-Width", loc="left", fontsize=11, fontweight="bold")
+    ax1.set_ylabel("Minimum Thread Count for >=50% Recovery", fontweight="bold")
+    ax1.set_title("A. Recovery Threshold vs. Bit-Width (missing = never reached)", loc="left", fontsize=11, fontweight="bold")
     ax1.set_xticks(bit_widths)
-    ax1.set_xlim(17, 3)
+    ax1.set_xlim(max(bit_widths) + 1, min(bit_widths) - 1)
     ax1.grid(True)
-    ax1.axvspan(7.0, 3.5, color="#f9ebea", alpha=0.8, label="Sub-8-Bit Collapse Zone")
-    ax1.legend(loc="upper right", frameon=True, facecolor="white")
+    if ax1.get_legend_handles_labels()[0]:
+        ax1.legend(loc="best", frameon=True, facecolor="white", fontsize=9)
 
-    # Panel B: Success rate at 10,000 threads across bit-width
-    at_10k = df[df["thread_count"] == 10000]
-    success_rates = []
-    for t in tiers:
-        sub_t = at_10k[at_10k["quantization"] == t]
-        rate = float(sub_t["success_rate_pct"].mean()) if len(sub_t) > 0 else 0.0
-        success_rates.append(rate)
+    # Panel B: recovery and precision at the largest thread count, mean over models
+    n_final = int(df["thread_count"].max())
+    at_final = df[df["thread_count"] == n_final]
+    rec = [float(at_final[at_final["quantization"] == t]["recovery_rate"].mean() or 0.0) for t in tiers]
+    prec = [float(at_final[at_final["quantization"] == t]["precision"].mean() or 0.0) for t in tiers]
+    rec = [0.0 if np.isnan(v) else v * 100.0 for v in rec]
+    prec = [0.0 if np.isnan(v) else v * 100.0 for v in prec]
 
-    bar_colors = ["#2980b9", "#27ae60", "#c0392b", "#c0392b"]
-    bars = ax2.bar([str(b) + "-bit\n(" + t + ")" for b, t in zip(bit_widths, tiers)], success_rates, color=bar_colors, edgecolor="#2c3e50", linewidth=1.2, width=0.55)
-    for bar, rate in zip(bars, success_rates):
-        ax2.annotate(f"{rate:.1f}%", xy=(bar.get_x() + bar.get_width() / 2, rate), xytext=(0, 4), textcoords="offset points", ha="center", va="bottom", fontweight="bold", fontsize=11)
+    xb = np.arange(len(tiers))
+    w = 0.36
+    b1 = ax2.bar(xb - w / 2, rec, w, label="Recovery", color="#2980b9", edgecolor="#2c3e50", linewidth=1.0)
+    b2 = ax2.bar(xb + w / 2, prec, w, label="Precision", color="#e67e22", edgecolor="#2c3e50", linewidth=1.0)
+    for bars in (b1, b2):
+        for bar in bars:
+            v = bar.get_height()
+            ax2.annotate(f"{v:.1f}%", xy=(bar.get_x() + bar.get_width() / 2, v), xytext=(0, 3),
+                         textcoords="offset points", ha="center", va="bottom", fontweight="bold", fontsize=10)
 
-    ax2.set_ylabel("Baseline Recovery Rate Across All 5 Architectures (%)", fontweight="bold")
-    ax2.set_xlabel("Precision Tier at N = 10,000 Threads", fontweight="bold")
-    ax2.set_title("B. High-Density Baseline Object Recovery (N = 10,000 Threads)", loc="left", fontsize=11, fontweight="bold")
+    ax2.set_xticks(xb)
+    ax2.set_xticklabels([f"{TIER_BITS.get(t, '?')}-bit\n({t})" for t in tiers])
+    ax2.set_ylabel(f"Mean over {len(models)} models (%)", fontweight="bold")
+    ax2.set_xlabel(f"Precision Tier at N = {n_final:,} Threads", fontweight="bold")
+    ax2.set_title(f"B. Recovery and Precision at N = {n_final:,} Threads", loc="left", fontsize=11, fontweight="bold")
     ax2.set_ylim(0, 115)
     ax2.yaxis.set_major_formatter(ticker.PercentFormatter(100))
     ax2.grid(True, axis="y")
+    ax2.legend(loc="upper right", frameon=True, facecolor="white")
 
-    fig.suptitle("Figure 4: The Quantization Frontier — Absolute Collapse of Sub-8-Bit Representations", y=1.02)
+    fig.suptitle("Figure 4: Effect of Quantization Bit-Width on Baseline Recovery", y=1.02)
     plt.tight_layout()
     save_figure(fig, os.path.join(out_dir, "fig4_quantization_bitwidth_impact"), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Figure 5: Pareto Cost vs Performance Trade-off
+# Figure 5: Storage vs recovery (Pareto)
 # -----------------------------------------------------------------------------
 def plot_figure_5(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[5/9] Generating Figure 5: Pareto Cost vs Performance Trade-off...")
+    print("[5/9] Generating Figure 5: Storage vs Recovery Pareto...")
     fig, ax = plt.subplots(figsize=(10, 6.5))
 
-    scatter_tiers = ["float16", "uint8", "uint6", "uint4"]
-    for tier in scatter_tiers:
-        sub = df[df["quantization"] == tier]
-        if not sub.empty:
-            bpt = sub["bytes_per_thread"].iloc[0] if "bytes_per_thread" in sub.columns else (4 if tier == "uint8" else 8)
-            ax.scatter(
-                sub["storage_kb"],
-                sub["confidence"],
-                s=np.clip(sub["thread_count"] / 100.0, 15, 120),
-                color=TIER_COLORS.get(tier, "#888"),
-                alpha=0.65,
-                edgecolors="none",
-                label=f"{tier} ({bpt} B/thread)",
-            )
+    # One point per (tier, thread count): recovery averaged over models
+    pts = (
+        df.groupby(["quantization", "thread_count"], as_index=False)
+        .agg(storage_kb=("storage_kb", "first"), recovery=("recovery_rate", "mean"))
+        .dropna(subset=["recovery"])
+    )
 
-    # Highlight Pareto optimal envelope (uint8 achieves 50% storage savings with equal confidence)
-    u8_detected = df[(df["quantization"] == "uint8") & (df["target_detected"])].sort_values("storage_kb")
-    if not u8_detected.empty:
-        pareto_pts = u8_detected.groupby("storage_kb")["confidence"].max().reset_index()
-        ax.plot(pareto_pts["storage_kb"], pareto_pts["confidence"], color="#27ae60", linestyle=":", linewidth=2.0, label="uint8 Efficiency Frontier")
+    for tier in present_tiers(pts):
+        sub = pts[pts["quantization"] == tier]
+        bpt = int(round(sub["storage_kb"].iloc[0] * 1000.0 / sub["thread_count"].iloc[0])) if not sub.empty else 0
+        ax.scatter(
+            sub["storage_kb"], sub["recovery"] * 100.0,
+            s=np.clip(sub["thread_count"] / 100.0, 15, 120),
+            color=tier_color(tier), alpha=0.7, edgecolors="none",
+            label=f"{tier} ({bpt} B/thread)",
+        )
+
+    # Pareto frontier: lowest storage for each new best recovery
+    ordered = pts.sort_values(["storage_kb", "recovery"], ascending=[True, False])
+    fx, fy, best = [], [], -1.0
+    for s, r in zip(ordered["storage_kb"], ordered["recovery"]):
+        if r > best:
+            fx.append(s)
+            fy.append(r * 100.0)
+            best = r
+    if fx:
+        ax.step(fx, fy, where="post", color="#2c3e50", linestyle=":", linewidth=2.0, label="Pareto frontier")
+
+    # Data-driven comparison note
+    n_final = int(df["thread_count"].max())
+    last = pts[pts["thread_count"] == n_final].set_index("quantization")["recovery"]
+    if "float16" in last.index and "uint8" in last.index:
+        ax.text(
+            0.02, 0.97,
+            f"At N = {n_final:,}: uint8 recovers {last['uint8'] * 100:.1f}% vs float16 {last['float16'] * 100:.1f}%\n"
+            "at half the storage per thread (8 B vs 16 B)",
+            transform=ax.transAxes, ha="left", va="top", fontsize=9.5, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#eafaf1", edgecolor="#27ae60"),
+        )
 
     ax.set_xlabel("Reconstruction File Size / Storage (KB)", fontweight="bold")
-    ax.set_ylabel("Mean Confidence of Recovered Detections", fontweight="bold")
-    ax.set_title("Figure 5: Pareto Trade-off: Storage Overhead vs. Recovered Detection Confidence", pad=12)
-    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel("Mean Object Recovery Rate over Models (%)", fontweight="bold")
+    ax.set_title("Figure 5: Storage Overhead vs. Baseline Object Recovery", pad=12)
+    ax.set_ylim(-5, 105)
+    ax.yaxis.set_major_formatter(ticker.PercentFormatter(100))
     ax.grid(True)
     ax.legend(loc="lower right", frameon=True, facecolor="white", edgecolor="#cccccc")
-
-    ax.annotate(
-        "uint8 Sweet Spot:\n50% Storage Reduction\nMatches float16 Confidence",
-        xy=(80, 0.85), xytext=(40, 0.60),
-        arrowprops=dict(facecolor="#27ae60", shrink=0.08, width=1.5, headwidth=6),
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="#eafaf1", edgecolor="#27ae60"),
-        fontsize=9.5, fontweight="bold"
-    )
 
     plt.tight_layout()
     save_figure(fig, os.path.join(out_dir, "fig5_pareto_cost_vs_performance"), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Figure 6: Generation Reconstruction Quality (PSNR & Storage)
+# Figure 6: Generation reconstruction quality (PSNR)
 # -----------------------------------------------------------------------------
 def plot_figure_6(df_gen: pd.DataFrame | None, out_dir: str, formats: Sequence[str], dpi: int) -> None:
     print("[6/9] Generating Figure 6: Generation Quality...")
@@ -462,15 +509,15 @@ def plot_figure_6(df_gen: pd.DataFrame | None, out_dir: str, formats: Sequence[s
 
     fig, ax1 = plt.subplots(figsize=(10, 6))
 
-    for tier in ["float32", "float16", "uint8", "uint6", "uint4"]:
+    for tier in present_tiers(df_gen):
         sub = df_gen[df_gen["quantization"] == tier].sort_values("thread_count")
         if not sub.empty:
             ax1.plot(
                 sub["thread_count"], sub["psnr_db"],
                 label=f"{tier} (PSNR)",
-                color=TIER_COLORS.get(tier, "#333"),
+                color=tier_color(tier),
                 linewidth=2.2,
-                linestyle="-" if tier in ["float32", "float16", "uint8"] else "--",
+                linestyle="-" if tier in ("float32", "float16", "uint8") else "--",
             )
 
     ax1.set_xlabel("Thread Count (N)", fontweight="bold")
@@ -484,126 +531,70 @@ def plot_figure_6(df_gen: pd.DataFrame | None, out_dir: str, formats: Sequence[s
 
 
 # -----------------------------------------------------------------------------
-# Figure 7: Inference Latency Distribution Across Models
+# Figure 7: Precision vs thread count (replaces the latency figure)
 # -----------------------------------------------------------------------------
 def plot_figure_7(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[7/9] Generating Figure 7: Inference Latency...")
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-
-    models = ["yolov8n", "yolov10n", "yolo11n", "yolo12n", "yolo26n"]
-    palette = [MODEL_COLORS[m] for m in models]
-
-    sns.boxplot(
-        data=df,
-        x="model",
-        y="inference_time_ms",
-        hue="model",
-        legend=False,
-        order=models,
-        palette=palette,
-        ax=ax,
-        fliersize=2,
-        linewidth=1.2,
-        boxprops=dict(alpha=0.8),
+    plot_metric_by_tier(
+        df, "precision", "Precision",
+        "Figure 7: Precision of Reconstructions (Extra Detections Count as False Positives)",
+        "fig7_precision_vs_threads", out_dir, formats, dpi,
+        "[7/9] Generating Figure 7: Precision vs Thread Count...",
     )
 
-    ax.set_xticks(range(len(models)))
-    ax.set_xticklabels([MODEL_LABELS[m] for m in models], fontweight="bold")
-    ax.set_ylabel("Inference Time (ms) on RTX 4060 GPU", fontweight="bold")
-    ax.set_xlabel("YOLO Model Architecture", fontweight="bold")
-    ax.set_title("Figure 7: Hardware Latency Distribution Across Architectures (Batch Size = 1)", pad=12)
-    ax.set_ylim(8, 45)
-    ax.grid(True, axis="y")
-
-    # Annotate median latency
-    medians = df.groupby("model")["inference_time_ms"].median()
-    for idx, m in enumerate(models):
-        med = medians.get(m, 0.0)
-        ax.annotate(f"{med:.1f} ms", xy=(idx, med), xytext=(0, 18), textcoords="offset points", ha="center", fontsize=9.5, fontweight="bold", color="#2c3e50")
-
-    plt.tight_layout()
-    save_figure(fig, os.path.join(out_dir, "fig7_inference_latency"), formats, dpi)
-
 
 # -----------------------------------------------------------------------------
-# Appendix Figure 1: Full Heatmaps (Model x Thread Count)
+# Appendix Figure 1: Recovery heatmaps (model x thread count)
 # -----------------------------------------------------------------------------
 def plot_appendix_heatmap(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[8/9] Generating Appendix Figure 1: Confidence Heatmaps...")
-    models = ["yolov8n", "yolo12n", "yolo11n", "yolov10n", "yolo26n"]
-    model_labels = [MODEL_LABELS[m] for m in models]
+    print("[8/9] Generating Appendix Figure 1: Recovery Heatmaps...")
+    models = present_models(df)
+    tiers = present_tiers(df)
+    model_labels = [model_label(m) for m in models]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    fig, axes = plt.subplots(len(tiers), 1, figsize=(14, 2.6 * len(tiers) + 1.5), sharex=True, squeeze=False)
 
-    for ax, tier in zip([ax1, ax2], ["float16", "uint8"]):
+    for ax, tier in zip(axes.flatten(), tiers):
         sub = df[df["quantization"] == tier]
-        pivot = sub.pivot_table(index="model", columns="thread_count", values="confidence", aggfunc="mean").reindex(models)
+        pivot = sub.pivot_table(index="model", columns="thread_count", values="recovery_rate", aggfunc="mean").reindex(models)
         sns.heatmap(
             pivot,
             ax=ax,
             cmap="mako",
             vmin=0.0,
             vmax=1.0,
-            cbar_kws={"label": "Mean Confidence", "shrink": 0.8},
+            cbar_kws={"label": "Recovery Rate", "shrink": 0.8},
             linewidths=0.2,
             linecolor="#333333",
         )
         ax.set_yticklabels(model_labels, rotation=0, fontweight="bold")
-        ax.set_ylabel(f"{tier}", fontweight="bold", fontsize=11)
-        ax.set_title(f"Model-Relative Detection Confidence Progression: {tier}", loc="left", fontsize=11, fontweight="bold")
+        ax.set_ylabel("")
+        ax.set_xlabel("")
+        ax.set_title(f"Object Recovery Rate: {tier}", loc="left", fontsize=11, fontweight="bold")
 
-    ax2.set_xlabel("Thread Count (N)", fontweight="bold")
-    fig.suptitle("Appendix Figure 1: Architectural Baseline Object Recovery Heatmaps across Thread Counts", y=1.02)
+    axes.flatten()[-1].set_xlabel("Thread Count (N)", fontweight="bold")
+    fig.suptitle("Appendix Figure 1: Baseline Object Recovery Heatmaps across Thread Counts", y=1.0)
     plt.tight_layout()
     save_figure(fig, os.path.join(out_dir, "fig_appendix_heatmap_confidence"), formats, dpi)
 
 
 # -----------------------------------------------------------------------------
-# Appendix Figure 2: Model-Relative Precision Dynamics (mAP@0.50 & mAP@0.50:0.95)
+# Appendix Figure 2: F1 vs thread count (replaces the mAP figure)
 # -----------------------------------------------------------------------------
 def plot_appendix_precision_dynamics(df: pd.DataFrame, out_dir: str, formats: Sequence[str], dpi: int) -> None:
-    print("[9/9] Generating Appendix Figure 2: Model-Relative Precision Dynamics...")
-    models = ["yolov8n", "yolo12n", "yolo11n", "yolov10n", "yolo26n"]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5), sharex=True)
-
-    sub_f16 = df[df["quantization"] == "float16"]
-
-    for m in models:
-        m_sub = sub_f16[sub_f16["model"] == m].sort_values("thread_count")
-        col = MODEL_COLORS.get(m, "#333")
-        lab = MODEL_LABELS.get(m, m)
-
-        if "mAP50" in m_sub.columns and m_sub["mAP50"].max() > 0:
-            ax1.plot(m_sub["thread_count"], m_sub["mAP50"], label=lab, color=col, linewidth=2.0, marker="o", markersize=3)
-        if "mAP50_95" in m_sub.columns and m_sub["mAP50_95"].max() > 0:
-            ax2.plot(m_sub["thread_count"], m_sub["mAP50_95"], label=lab, color=col, linewidth=2.0, marker="s", markersize=3)
-
-    ax1.set_title("A. Mean mAP@0.50 vs. Baseline Ground Truth", loc="left", fontweight="bold")
-    ax1.set_xlabel("Thread Count (N)", fontweight="bold")
-    ax1.set_ylabel("mAP @ IoU 0.50", fontweight="bold")
-    ax1.set_ylim(-0.05, 1.05)
-    ax1.grid(True)
-    ax1.legend(loc="lower right", frameon=True, facecolor="white", edgecolor="#cccccc")
-
-    ax2.set_title("B. Mean mAP@0.50:0.95 vs. Baseline Ground Truth", loc="left", fontweight="bold")
-    ax2.set_xlabel("Thread Count (N)", fontweight="bold")
-    ax2.set_ylabel("mAP @ IoU 0.50:0.95", fontweight="bold")
-    ax2.set_ylim(-0.05, 1.05)
-    ax2.grid(True)
-    ax2.legend(loc="lower right", frameon=True, facecolor="white", edgecolor="#cccccc")
-
-    fig.suptitle("Appendix Figure 2: Model-Relative Precision Metrics Across Thread Counts (float16 Tier)", y=1.02)
-    plt.tight_layout()
-    save_figure(fig, os.path.join(out_dir, "fig_appendix_precision_dynamics"), formats, dpi)
+    plot_metric_by_tier(
+        df, "f1", "F1 (Recovery and Precision)",
+        "Appendix Figure 2: F1 Combining Recovery and Precision Across Thread Counts",
+        "fig_appendix_precision_dynamics", out_dir, formats, dpi,
+        "[9/9] Generating Appendix Figure 2: F1 vs Thread Count...",
+    )
 
 
 # -----------------------------------------------------------------------------
-# Main CLI Runner
+# Main CLI runner
 # -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate publication figures for Digital Filography and YOLO benchmarks.")
-    parser.add_argument("--benchmark-csv", type=str, default="output/dataset_evaluation_summary.csv", help="Path to YOLO benchmark results CSV")
+    parser = argparse.ArgumentParser(description="Generate publication figures for Digital Filography benchmarks.")
+    parser.add_argument("--benchmark-csv", type=str, default="output/dataset_evaluation_summary.csv", help="Path to summary CSV")
     parser.add_argument("--generation-csv", type=str, default="output/generation.csv", help="Path to Filography generation metrics CSV")
     parser.add_argument("--output-dir", type=str, default="graphs", help="Directory to save generated plots")
     parser.add_argument("--dpi", type=int, default=300, help="DPI for raster output")
@@ -616,7 +607,7 @@ def main() -> int:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("================================================================================")
-    print("Generating Digital Filography & YOLO Detection Publication Visualizations")
+    print("Generating Digital Filography Publication Visualizations")
     print(f"Benchmark CSV:    {args.benchmark_csv}")
     print(f"Generation CSV:   {args.generation_csv}")
     print(f"Output Directory: {args.output_dir}")
@@ -624,9 +615,8 @@ def main() -> int:
     print("================================================================================")
 
     df_filo, df_gen = load_clean_data(args.benchmark_csv, args.generation_csv)
-    print(f"Loaded {len(df_filo)} filography benchmark records.")
+    print(f"Loaded {len(df_filo)} summary records for models: {present_models(df_filo)}")
 
-    # Generate Figures
     plot_figure_1(df_filo, args.output_dir, args.formats, args.dpi)
     plot_figure_2(df_filo, args.output_dir, args.formats, args.dpi)
     plot_figure_3(df_filo, args.output_dir, args.formats, args.dpi)
@@ -637,7 +627,7 @@ def main() -> int:
     plot_appendix_heatmap(df_filo, args.output_dir, args.formats, args.dpi)
     plot_appendix_precision_dynamics(df_filo, args.output_dir, args.formats, args.dpi)
 
-    print("\nAll figures generated successfully in graphs/!")
+    print(f"\nAll figures generated successfully in {args.output_dir}/!")
     return 0
 
 
