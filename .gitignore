@@ -2,3 +2,10 @@
 *.pt
 dataset/
 
+output/*
+!output/dataset_evaluation_summary.csv
+
+output/
+output_v2/
+*.jsonl
+

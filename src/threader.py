@@ -371,11 +371,18 @@ def render_threads(
     height_px: int,
     background: Sequence[float],
     thread_width: float,
+    canvas: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Render an N x 8 thread matrix onto a background canvas."""
+    """Render an N x 8 thread matrix onto a background canvas.
+
+    If `canvas` is given, the threads are drawn onto it in place and the same
+    array is returned. Threads are drawn in order, so drawing threads 0..a and
+    then a..b onto that canvas gives exactly the pixels of drawing 0..b at once.
+    """
     c_channels = len(background)
-    canvas = np.empty((height_px, width_px, c_channels), dtype=np.float32)
-    canvas[:] = np.asarray(background, dtype=np.float32).reshape(1, 1, -1)
+    if canvas is None:
+        canvas = np.empty((height_px, width_px, c_channels), dtype=np.float32)
+        canvas[:] = np.asarray(background, dtype=np.float32).reshape(1, 1, -1)
     half_width = float(thread_width) / 2.0
     reach = half_width + 1.0
 

@@ -4,8 +4,14 @@
 For every image in the dataset manifest and every detector model:
 - The model is run on the uncompressed (resized) photo. Its detections are that
   model's own baseline.
-- Filography reconstructions are rendered at many thread counts and 3 precision
-  tiers (float16, uint8, uint6) and run through the same model.
+- Filography reconstructions are rendered at many thread counts and in 6 packed
+  storage formats and run through the same model. Every thread matrix is really
+  packed into bytes and decoded again before it is drawn (see packing.py and
+  packing_uint7.py):
+
+      uniform_fp16   uniform_uint8   uniform_uint7    all 8 values at one precision
+      adjusted_fp16  adjusted_uint8  adjusted_uint7   coordinates at that precision,
+                                                      colour + alpha as RGBA4444
 - Each reconstruction is scored against the same model's baseline:
 
       recovery_rate = matched baseline objects / baseline objects
@@ -31,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -38,7 +45,8 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 from typing import Any, Sequence
 
 import numpy as np
@@ -51,17 +59,40 @@ SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+from packing import bytes_per_thread as _bytes_per_thread_old
+from packing import quantize_threads as _quantize_threads_old
+from packing_uint7 import UINT7_FORMATS
+from packing_uint7 import bytes_per_thread as _bytes_per_thread_7
+from packing_uint7 import quantize_threads as _quantize_threads_7
 from threader import ThreadPainter, load_image, render_threads
 
+# The uint7 formats replace the uint6 ones. fp16 and uint8 still go through the
+# original packing module, so their results are identical to earlier runs.
+FORMATS = (
+    "uniform_fp16", "uniform_uint8", "uniform_uint7",
+    "adjusted_fp16", "adjusted_uint8", "adjusted_uint7",
+)
 
-SCHEMA_VERSION = 2
-TIERS = ("float16", "uint8", "uint6")
-BYTES_PER_THREAD = {
-    "float32": 32,
-    "float16": 16,
-    "uint8": 8,
-    "uint6": 6,
-}
+
+def bytes_per_thread(tier: str) -> float:
+    """Storage per thread in bytes for any supported format."""
+    if tier in UINT7_FORMATS:
+        return _bytes_per_thread_7(tier)
+    return _bytes_per_thread_old(tier)
+
+
+def quantize_threads(threads: np.ndarray, tier: str) -> tuple[np.ndarray, int]:
+    """Pack threads into bytes and decode them again. Returns (decoded, packed byte count)."""
+    if tier in UINT7_FORMATS:
+        return _quantize_threads_7(threads, tier)
+    return _quantize_threads_old(threads, tier)
+
+
+SCHEMA_VERSION = 4
+# One "tier" is one packed storage format. The CSV column is still called
+# `quantization` so generate_graphs.py keeps working.
+TIERS = FORMATS
+BYTES_PER_THREAD = {tier: bytes_per_thread(tier) for tier in TIERS}
 FLOP_CANDIDATES_PER_THREAD = 304
 IOU_MATCH = 0.50
 RELIABLE_RECOVERY = 0.50
@@ -126,24 +157,6 @@ def match_detections(
             matched_confs.append(p["conf"])
 
     return matched_ious, matched_confs
-
-
-def quantize_threads(threads: np.ndarray, tier: str) -> np.ndarray:
-    """Quantize normalized [0, 1] threads to the specified precision tier."""
-    if tier == "float32":
-        return threads.astype(np.float32)
-    elif tier == "float16":
-        return threads.astype(np.float16).astype(np.float32)
-    elif tier == "uint8":
-        return np.clip(np.round(threads * 255.0), 0, 255).astype(np.float32) / 255.0
-    elif tier == "uint6":
-        return np.clip(np.round(threads * 63.0), 0, 63).astype(np.float32) / 63.0
-    elif tier == "uint5":
-        return np.clip(np.round(threads * 31.0), 0, 31).astype(np.float32) / 31.0
-    elif tier == "uint4":
-        return np.clip(np.round(threads * 15.0), 0, 15).astype(np.float32) / 15.0
-    else:
-        raise ValueError(f"Unknown tier: {tier}")
 
 
 # -----------------------------------------------------------------------------
@@ -344,6 +357,25 @@ def worker_thread_placement(
     return idx, img_path, w, h, snaps
 
 
+def bounded_results(executor: ProcessPoolExecutor, tasks: Sequence[Any], window: int):
+    """Yield worker results as they finish, with at most `window` tasks queued or waiting.
+
+    Submitting every task at once and keeping every future alive kept all thread
+    snapshots (about 6.5 MB per image) in RAM until the end of the run. Here a new
+    task is only submitted when an earlier one has finished, and a finished future
+    is dropped as soon as its result has been handed to the caller.
+    """
+    task_iter = iter(tasks)
+    in_flight = {executor.submit(worker_thread_placement, t) for t in islice(task_iter, window)}
+    while in_flight:
+        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+        for fut in done:
+            nxt = next(task_iter, None)
+            if nxt is not None:
+                in_flight.add(executor.submit(worker_thread_placement, nxt))
+            yield fut.result()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark digital filography reconstructions against each detector's own baseline."
@@ -453,7 +485,8 @@ def main() -> int:
     print(f"Device:           {args.device}")
     print(f"Confidence:       {args.conf}")
     print(f"Thread counts:    {len(thread_counts)} steps ({args.min_threads}..{args.max_threads}, step {args.step})")
-    print(f"Quantization:     {list(TIERS)} ({len(TIERS)} tiers)")
+    print(f"Packed formats:   {list(TIERS)} ({len(TIERS)} formats)")
+    print("Bytes / thread:   " + ", ".join(f"{t}={BYTES_PER_THREAD[t]}" for t in TIERS))
     print(f"CPU Workers:      {args.workers} processes")
     print(f"Total per image:  {1 + len(thread_counts) * len(TIERS)} configs x {len(args.models)} models")
     print(f"Total inferences: {total_images * (1 + len(thread_counts) * len(TIERS)) * len(args.models):,}")
@@ -475,6 +508,10 @@ def main() -> int:
         "conf": args.conf,
         "size": args.size,
         "images": total_images,
+        # Same image count but a different download must not resume an old checkpoint.
+        "dataset_sha1": hashlib.sha1(
+            "\n".join(sorted(os.path.basename(p) for p in image_files)).encode("utf-8")
+        ).hexdigest()[:12],
     }
     ckpt_path = os.path.join(args.output_dir, "checkpoint_rows.jsonl")
     all_filo_rows: list[dict[str, Any]] = []
@@ -565,14 +602,9 @@ def main() -> int:
     t_eval_start = time.time()
     completed_images = 0
 
+    todo = [t for t in worker_tasks if t[0] not in done_images]
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        future_to_idx = {
-            executor.submit(worker_thread_placement, t): t[0]
-            for t in worker_tasks if t[0] not in done_images
-        }
-
-        for future in as_completed(future_to_idx):
-            idx, img_path, w, h, snaps = future.result()
+        for idx, img_path, w, h, snaps in bounded_results(executor, todo, window=args.workers * 2):
             completed_images += 1
             fname = os.path.basename(img_path)
 
@@ -581,12 +613,29 @@ def main() -> int:
             target_norm = np.asarray(base_pil, dtype=np.float32) / 255.0
 
             img_start_len = len(all_filo_rows)
+            # One running canvas per storage format. Thread counts go up, so each
+            # step only draws the new threads on top of the previous canvas. The
+            # pixels are identical to drawing all N threads from scratch.
+            canvases = {
+                tier: np.full((h, w, 3), np.asarray(bg, dtype=np.float32).reshape(1, 1, 3), dtype=np.float32)
+                for tier in TIERS
+            }
+            drawn = 0
             for count in thread_counts:
                 raw_threads = snaps[count]
 
                 for tier in TIERS:
-                    q_threads = quantize_threads(raw_threads, tier)
-                    canvas = render_threads(q_threads, w, h, bg, thread_width)
+                    # Real round trip: floats -> packed bytes -> floats.
+                    q_threads, packed_bytes = quantize_threads(raw_threads, tier)
+                    # 5.5 bytes per thread is not a whole number, so compare against
+                    # the size rounded up to a whole byte.
+                    expected_bytes = math.ceil(count * BYTES_PER_THREAD[tier])
+                    if packed_bytes != expected_bytes:
+                        raise RuntimeError(
+                            f"{tier}: packed {count} threads into {packed_bytes} bytes, "
+                            f"expected {expected_bytes}"
+                        )
+                    canvas = render_threads(q_threads[drawn:], w, h, bg, thread_width, canvas=canvases[tier])
                     pixels = np.clip(canvas * 255.0 + 0.5, 0, 255).astype(np.uint8)
                     filo_pil = Image.fromarray(pixels)
 
@@ -619,6 +668,8 @@ def main() -> int:
                             psnr=psnr,
                             all_dets=fmt_dets(preds),
                         ))
+
+                drawn = count  # every format has now drawn threads 0..count-1
 
             with open(ckpt_path, "a", encoding="utf-8") as ck:
                 ck.write("".join(json.dumps(r) + "\n" for r in all_filo_rows[img_start_len:]))
@@ -779,13 +830,13 @@ def main() -> int:
             if hits:
                 first = hits[0]
                 print(
-                    f"  {tier:8s}: >=50% recovery first at N={first['thread_count']:5d} "
+                    f"  {tier:14s}: >=50% recovery first at N={first['thread_count']:5d} "
                     f"(precision {pct(first['precision'])}) | {final_txt}"
                 )
             else:
                 best = max(tier_rows, key=lambda r: r["recovery_rate"] or 0.0)
                 print(
-                    f"  {tier:8s}: never reached 50% recovery "
+                    f"  {tier:14s}: never reached 50% recovery "
                     f"(peak {pct(best['recovery_rate'])} at N={best['thread_count']}) | {final_txt}"
                 )
 

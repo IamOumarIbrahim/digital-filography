@@ -35,7 +35,10 @@ that works directly on threads.
      load_image (loads and resizes to 640 px on the longest side).
 2. eval_dataset.py: my benchmark.
    - Tests many YOLO models on COCO images drawn with threads.
-   - Uses TIERS (float16, uint8, uint6) to simulate lower precision.
+   - Uses TIERS = 6 packed formats from packing.py (uniform_ and adjusted_ with
+     fp16, uint8, uint6). Threads are really packed into bytes and decoded
+     again before they are drawn.
+   - The test set is 500 COCO images with no per-class quota (download_dataset.py).
    - Ground truth is the model's own detections on the original image
      (a "model-relative baseline").
    - Saves a checkpoint file (checkpoint_rows.jsonl) so a run can resume.
@@ -116,3 +119,12 @@ Look at TotalSeconds. The number in generation.csv is a formula, not a real meas
  7.3 Baseline: fine-tune a YOLO on thread images. On Windows, set workers=0 in training if the data loader crashes.
  7.4 Quick test: do places where threads cross predict object locations better than plain thread density?
  7.5 Then build the thread-based detector (threads as nodes, crossings as links).
+
+
+ TODO:
+ Lock the format. Use 8-bit and retire uint6 and fp16 (except as the ceiling reference). Use adjusted below about 50 KB and uniform above about 60 KB.
+Close the data gaps. Run uint8 beyond 10000 threads to find the real saturation point. Test 7-bit, and test which field you quantize (the one that causes the uint6 collapse).
+Change the metric. Rank everything by recovery and F1 per KB, and add confidence intervals by bootstrapping over the 500 images.
+Add the missing control. Compare against JPEG, WebP or AVIF at the same KB. Nothing in this data shows that threads beat a normal codec, and that decides whether the approach is worth continuing.
+Test the upside. Fine-tune a detector on thread reconstructions, or add a detection-aware loss when fitting threads. This is a hypothesis, but it targets the main failure, which is missed objects.
+Validate wider. Check results by object size and class, with yolo12n as the main detector and yolov8n as the weak check.
