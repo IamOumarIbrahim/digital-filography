@@ -20,6 +20,14 @@
     "selected_classes": [],
     "seed": 0
   },
+  "metrics": {
+    "speed_breakdown": true,
+    "model_complexity": true,
+    "vram_usage": true,
+    "detection_accuracy": true,
+    "iterations": 20,
+    "warmup_passes": 5
+  },
   "model_specific": {
     "yolo26n.pt": {
       "conf": 0.25,

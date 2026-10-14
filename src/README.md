@@ -12,7 +12,8 @@ YOLO model selection, and CUDA hardware benchmarking; run it from the project ro
 | Select model(s) | Choose one or multiple YOLO models (`yolo26n.pt`, `yolo11n.pt`, `yolov8n.pt`, `yolov10n.pt`, `yolo12n.pt`) |
 | Configure shared settings | Manage shared pipeline settings: compute device (`CUDA:0`), random seed(s), epochs, batch size, learning rate, image size, workers |
 | Configure model settings | Edit model-specific parameters (`conf`, `iou`, `imgsz`, `half` FP16, `max_det`, overrides) per model |
-| Test latency (benchmark) | Run real-time inference latency benchmark (avg ms, FPS, min/max) on CUDA GPU or CPU |
+| Configure tracked metrics | Toggle metrics tracking (speed breakdown, model complexity, GPU VRAM, accuracy) and benchmark iterations |
+| Test latency (benchmark) | Run real-time inference latency benchmark (avg ms, FPS, min/max, VRAM, speed breakdown) on CUDA GPU or CPU |
 | Run training | Review active models, shared settings, and initiate training pipeline |
 | Clear results | Remove previous run artefacts (`runs/`, `results/`) |
 | All settings | View and edit all shared and model-specific settings from a single place |
@@ -32,7 +33,7 @@ Users can select a single model or toggle multiple models simultaneously from th
 ---
 
 ## Configuration (`config/config.json`)
-Settings are clearly separated into `selected_models`, `shared` pipeline settings, and `model_specific` overrides:
+Settings are clearly separated into `selected_models`, `shared` pipeline settings, `metrics` tracking preferences, and `model_specific` overrides:
 
 ```json
 {
@@ -50,6 +51,14 @@ Settings are clearly separated into `selected_models`, `shared` pipeline setting
     "workers": 8,
     "num_images": 5000,
     "selected_classes": []
+  },
+  "metrics": {
+    "speed_breakdown": true,
+    "model_complexity": true,
+    "vram_usage": true,
+    "detection_accuracy": true,
+    "iterations": 20,
+    "warmup_passes": 5
   },
   "model_specific": {
     "yolo26n.pt": {

@@ -109,8 +109,11 @@ def fetch(request):
             last_error = error
         except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError) as error:
             last_error = error
-        time.sleep(1.5 * (attempt + 1))
-    raise last_error
+        if attempt < RETRIES - 1:
+            time.sleep(1.5 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Request failed after {RETRIES} attempts.")
 
 
 class RemoteFile(io.RawIOBase):

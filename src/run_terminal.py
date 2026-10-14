@@ -330,6 +330,49 @@ MODEL_SPECIFIC_SCHEMA = {
     },
 }
 
+METRICS_SCHEMA = {
+    "speed_breakdown": {
+        "label":       "Speed breakdown (preprocess, inference, postprocess)",
+        "description": "Measure separate timings for image prep, model forward, and NMS in ms",
+        "type":        bool,
+        "default":     True,
+    },
+    "model_complexity": {
+        "label":       "Model complexity (parameter count & file size)",
+        "description": "Extract total parameters (M) and model weights disk size (MB)",
+        "type":        bool,
+        "default":     True,
+    },
+    "vram_usage": {
+        "label":       "GPU VRAM memory tracking (allocated & reserved)",
+        "description": "Track peak CUDA memory allocated and reserved during inference (MB)",
+        "type":        bool,
+        "default":     True,
+    },
+    "detection_accuracy": {
+        "label":       "Detection quality metrics (mAP50, mAP50-95, P, R)",
+        "description": "Evaluate object detection precision, recall, and mAP on dataset",
+        "type":        bool,
+        "default":     True,
+    },
+    "iterations": {
+        "label":       "Benchmark iterations",
+        "description": "Number of timed iterations per model for latency / FPS benchmarking",
+        "type":        int,
+        "default":     20,
+        "min":         5,
+        "max":         500,
+    },
+    "warmup_passes": {
+        "label":       "Warmup passes",
+        "description": "Number of warmup inference passes before measuring latency",
+        "type":        int,
+        "default":     5,
+        "min":         0,
+        "max":         50,
+    },
+}
+
 
 def format_value(spec, value):
     """Format setting value for display."""
@@ -416,6 +459,7 @@ def load_settings():
     shared["selected_classes"] = []
     selected_models = ["yolov8n.pt"]
     model_specific = default_model_specific_dict()
+    metrics = {k: spec["default"] for k, spec in METRICS_SCHEMA.items()}
 
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -423,6 +467,7 @@ def load_settings():
         return {
             "shared": shared,
             "selected_models": selected_models,
+            "metrics": metrics,
             "model_specific": model_specific,
         }
 
@@ -430,6 +475,7 @@ def load_settings():
         return {
             "shared": shared,
             "selected_models": selected_models,
+            "metrics": metrics,
             "model_specific": model_specific,
         }
 
@@ -495,9 +541,19 @@ def load_settings():
                     except (ValueError, TypeError):
                         pass
 
+    # 4. Load metrics settings
+    metrics_src = saved.get("metrics")
+    if isinstance(metrics_src, dict):
+        for k, spec in METRICS_SCHEMA.items():
+            if k in metrics_src:
+                val, err = parse_value(spec, str(metrics_src[k]))
+                if err is None:
+                    metrics[k] = val
+
     return {
         "shared": shared,
         "selected_models": selected_models,
+        "metrics": metrics,
         "model_specific": model_specific,
     }
 
@@ -524,6 +580,7 @@ def save_settings(data):
         payload = {
             "selected_models": data["selected_models"],
             "shared": data["shared"],
+            "metrics": data.get("metrics", {k: s["default"] for k, s in METRICS_SCHEMA.items()}),
             "model_specific": data["model_specific"],
         }
         CONFIG_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -544,6 +601,7 @@ class App:
         self.shared_settings  = loaded["shared"]
         self.selected_models  = list(loaded["selected_models"])
         self.model_settings   = loaded["model_specific"]
+        self.metrics          = loaded.get("metrics", {k: s["default"] for k, s in METRICS_SCHEMA.items()})
         self.selected_classes = list(self.shared_settings.get("selected_classes", []))
         self.editing_model    = None
         self.current          = "main"
@@ -558,6 +616,7 @@ class App:
         payload = {
             "selected_models": self.selected_models,
             "shared": self.shared_settings,
+            "metrics": self.metrics,
             "model_specific": self.model_settings,
         }
         return save_settings(payload)
@@ -975,6 +1034,89 @@ def model_list_menu_items(app):
 
 
 # ---------------------------------------------------------------------------
+# Tracked Metrics Configuration
+# ---------------------------------------------------------------------------
+
+def action_toggle_metric(app, key: str):
+    spec = METRICS_SCHEMA[key]
+    if spec["type"] is bool:
+        app.metrics[key] = not app.metrics.get(key, spec["default"])
+        app.save()
+        status_txt = "ON" if app.metrics[key] else "OFF"
+        app.notify("success", f"Metric '{spec['label']}' is now {status_txt}.")
+    else:
+        edit_metric_setting(app, key)
+
+
+def edit_metric_setting(app, key: str):
+    spec = METRICS_SCHEMA[key]
+    current = app.metrics.get(key, spec["default"])
+    print()
+    print(paint(spec["label"], BOLD, CYAN))
+    if "description" in spec:
+        print(paint(spec["description"], DIM))
+    low = format_value(spec, spec["min"])
+    high = format_value(spec, spec["max"])
+    print(f"Allowed range: {low} to {high}. Current value: {current}")
+    raw = input(paint("New value (press Enter to cancel): ", BOLD, MAGENTA))
+    if not raw.strip():
+        app.notify("info", "No changes made.")
+        return
+    value, error = parse_value(spec, raw)
+    if error:
+        say("warning", error)
+        return
+    app.metrics[key] = value
+    app.save()
+    app.notify("success", f"{spec['label']} set to {value}.")
+
+
+def action_enable_all_metrics(app):
+    for k, spec in METRICS_SCHEMA.items():
+        if spec["type"] is bool:
+            app.metrics[k] = True
+    app.save()
+    app.notify("success", "Enabled all tracking metrics.")
+
+
+def action_reset_metrics(app):
+    for k, spec in METRICS_SCHEMA.items():
+        app.metrics[k] = spec["default"]
+    app.save()
+    app.notify("info", "Reset metrics configuration to defaults.")
+
+
+def metrics_items(app):
+    items = []
+    for key, spec in METRICS_SCHEMA.items():
+        val = app.metrics.get(key, spec["default"])
+        if spec["type"] is bool:
+            detail = "✔ ON" if val else "✘ OFF"
+        else:
+            detail = str(val)
+        items.append(
+            Item(
+                label=spec["label"],
+                action=lambda a, k=key: action_toggle_metric(a, k),
+                detail=detail,
+            )
+        )
+    items.append(Item("Enable all tracking metrics", action_enable_all_metrics))
+    items.append(Item("Reset metrics to defaults", action_reset_metrics))
+    return items
+
+
+def metrics_body(app):
+    active_count = sum(1 for k, s in METRICS_SCHEMA.items() if s["type"] is bool and app.metrics.get(k, s["default"]))
+    total_bools = sum(1 for k, s in METRICS_SCHEMA.items() if s["type"] is bool)
+    return [
+        "Select what metrics to compute and display during benchmarking and evaluation.",
+        f"Active metrics: {paint(f'{active_count}/{total_bools} enabled', BOLD, GREEN)} | Iterations: {app.metrics.get('iterations', 20)} | Warmup: {app.metrics.get('warmup_passes', 5)}",
+        "Toggle boolean flags by number, or select numeric options to adjust counts.",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Class selection
 # ---------------------------------------------------------------------------
 
@@ -1256,8 +1398,14 @@ def action_test_latency(app):
     timestamp_str = start_time.strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = get_results_dir() / timestamp_str
 
+    iterations = app.metrics.get("iterations", 20)
+    warmup_passes = app.metrics.get("warmup_passes", 5)
+    track_speed = app.metrics.get("speed_breakdown", True)
+    track_complexity = app.metrics.get("model_complexity", True)
+
     print()
-    say("info", f"Initializing latency benchmark for {len(target_models)} model(s)...")
+    say("info", f"Initializing benchmark for {len(target_models)} model(s)...")
+    say("info", f"Benchmark configuration: {iterations} timed iterations, {warmup_passes} warmup passes")
     if len(seeds) > 1:
         say("info", f"Seed(s) active: {paint(', '.join(str(s) for s in seeds), BOLD, GREEN)} ({len(seeds)} seeds)")
     else:
@@ -1271,6 +1419,7 @@ def action_test_latency(app):
         return
 
     cuda_active = resolved_device.startswith("cuda")
+    track_vram = app.metrics.get("vram_usage", True) and cuda_active
     device_desc = resolved_device
     if cuda_active:
         import torch
@@ -1314,6 +1463,14 @@ def action_test_latency(app):
                 if not is_on_cuda:
                     raise RuntimeError(f"Failed to place {model_name} onto CUDA.")
 
+            params_m = None
+            size_mb = None
+            if track_complexity:
+                if hasattr(model, "model") and hasattr(model.model, "parameters"):
+                    params_m = sum(p.numel() for p in model.model.parameters()) / 1e6
+                if model_path.exists():
+                    size_mb = model_path.stat().st_size / (1024 * 1024)
+
             dummy_input = np.zeros((img_size, img_size, 3), dtype=np.uint8)
             predict_kwargs = {
                 "device": resolved_device,
@@ -1324,8 +1481,12 @@ def action_test_latency(app):
             if half_precision:
                 predict_kwargs["half"] = True
 
+            if track_vram and cuda_active:
+                import torch
+                torch.cuda.reset_peak_memory_stats()
+
             # Warmup passes
-            for _ in range(5):
+            for _ in range(warmup_passes):
                 _ = model.predict(dummy_input, **predict_kwargs)
 
             if cuda_active:
@@ -1333,22 +1494,35 @@ def action_test_latency(app):
                 torch.cuda.synchronize()
 
             # Timed iterations
-            iterations = 20
             latencies = []
+            speed_samples = []
             for _ in range(iterations):
                 t0 = time.perf_counter()
-                _ = model.predict(dummy_input, **predict_kwargs)
+                preds = model.predict(dummy_input, **predict_kwargs)
                 if cuda_active:
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 latencies.append((t1 - t0) * 1000.0)
+                if track_speed and preds and hasattr(preds[0], "speed"):
+                    speed_samples.append(preds[0].speed)
 
             avg_ms = sum(latencies) / len(latencies)
             min_ms = min(latencies)
             max_ms = max(latencies)
             fps = 1000.0 / avg_ms if avg_ms > 0 else 0
 
-            results.append({
+            pre_ms = sum(s.get("preprocess", 0) for s in speed_samples) / len(speed_samples) if speed_samples else 0.0
+            inf_ms = sum(s.get("inference", 0) for s in speed_samples) / len(speed_samples) if speed_samples else 0.0
+            post_ms = sum(s.get("postprocess", 0) for s in speed_samples) / len(speed_samples) if speed_samples else 0.0
+
+            peak_vram = None
+            res_vram = None
+            if track_vram and cuda_active:
+                import torch
+                peak_vram = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                res_vram = torch.cuda.max_memory_reserved() / (1024 * 1024)
+
+            entry = {
                 "model": model_name,
                 "avg_ms": avg_ms,
                 "min_ms": min_ms,
@@ -1356,7 +1530,20 @@ def action_test_latency(app):
                 "fps": fps,
                 "precision": "FP16" if half_precision else "FP32",
                 "imgsz": img_size,
-            })
+            }
+            if params_m is not None:
+                entry["params_m"] = params_m
+            if size_mb is not None:
+                entry["size_mb"] = size_mb
+            if track_speed and speed_samples:
+                entry["preprocess_ms"] = pre_ms
+                entry["inference_ms"] = inf_ms
+                entry["postprocess_ms"] = post_ms
+            if peak_vram is not None:
+                entry["peak_vram_mb"] = peak_vram
+                entry["reserved_vram_mb"] = res_vram
+
+            results.append(entry)
         except Exception as exc:  # noqa: BLE001
             say("error", f"Error benchmarking {model_name}: {exc}")
 
@@ -1376,8 +1563,9 @@ def action_test_latency(app):
         "device_description": device_desc,
         "seeds": seeds,
         "seed": seeds[0],
-        "iterations": 20,
-        "warmup_passes": 5,
+        "iterations": iterations,
+        "warmup_passes": warmup_passes,
+        "tracked_metrics": app.metrics,
         "results": results,
     }
     (run_dir / "latency_benchmark.json").write_text(
@@ -1386,40 +1574,63 @@ def action_test_latency(app):
 
     # Save human-readable summary
     summary_lines = [
-        "═" * 76,
-        f" LATENCY BENCHMARK RESULTS ({device_desc})",
-        f" Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        "═" * 76,
-        f" {'Model':<16} {'Size':<6} {'Precision':<10} {'Latency (avg)':<16} {'Min/Max':<16} {'FPS':<8}",
-        "-" * 76,
+        "═" * 86,
+        f" BENCHMARK & METRICS REPORT ({device_desc})",
+        f" Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')} | Iterations: {iterations} | Warmup: {warmup_passes}",
+        "═" * 86,
+        f" {'Model':<14} {'Params':<8} {'Disk':<8} {'Prec.':<6} {'Latency (avg)':<15} {'Inference':<12} {'FPS':<7} {'Peak VRAM':<10}",
+        "-" * 86,
     ]
     for r in results:
-        m_str = f" {r['model']:<15} "
-        sz_str = f"{r['imgsz']:<6} "
-        pr_str = f"{r['precision']:<10} "
-        lat_str = f"{r['avg_ms']:.2f} ms".ljust(16)
-        mm_str = f"{r['min_ms']:.1f}/{r['max_ms']:.1f}ms".ljust(16)
-        fps_str = f"{r['fps']:.1f}".ljust(8)
-        summary_lines.append(m_str + sz_str + pr_str + lat_str + mm_str + fps_str)
-    summary_lines.append("═" * 76)
+        m_str   = f" {r['model']:<13} "
+        p_str   = f"{r.get('params_m', 0):.2f}M".ljust(8) if "params_m" in r else "—".ljust(8)
+        sz_str  = f"{r.get('size_mb', 0):.1f}MB".ljust(8) if "size_mb" in r else "—".ljust(8)
+        pr_str  = f"{r['precision']:<6} "
+        lat_str = f"{r['avg_ms']:.2f} ms".ljust(15)
+        inf_str = f"{r.get('inference_ms', r['avg_ms']):.2f} ms".ljust(12)
+        fps_str = f"{r['fps']:.1f}".ljust(7)
+        vr_str  = f"{r['peak_vram_mb']:.1f} MB".ljust(10) if "peak_vram_mb" in r else "—".ljust(10)
+        summary_lines.append(m_str + p_str + sz_str + pr_str + lat_str + inf_str + fps_str + vr_str)
+
+    if track_speed:
+        summary_lines.append("-" * 86)
+        summary_lines.append(" Detailed Speed Breakdown (Averages in ms):")
+        for r in results:
+            if "preprocess_ms" in r:
+                summary_lines.append(
+                    f"   • {r['model']:<14}: Preprocess={r['preprocess_ms']:.2f}ms | Forward={r['inference_ms']:.2f}ms | Postprocess={r['postprocess_ms']:.2f}ms | Total={r['avg_ms']:.2f}ms"
+                )
+    summary_lines.append("═" * 86)
     (run_dir / "latency_benchmark.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
-    # Print formatted benchmark summary table
+    # Print formatted benchmark summary table to console
     print()
-    print(paint("═" * 76, BOLD, CYAN))
-    print(paint(f" LATENCY BENCHMARK RESULTS ({device_desc})", BOLD, WHITE))
-    print(paint("═" * 76, BOLD, CYAN))
-    print(f" {'Model':<16} {'Size':<6} {'Precision':<10} {'Latency (avg)':<16} {'Min/Max':<16} {'FPS':<8}")
-    print("-" * 76)
+    print(paint("═" * 86, BOLD, CYAN))
+    print(paint(f" BENCHMARK & METRICS REPORT ({device_desc})", BOLD, WHITE))
+    print(paint(f" Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')} | Iterations: {iterations} | Warmup: {warmup_passes}", DIM))
+    print(paint("═" * 86, BOLD, CYAN))
+    print(f" {'Model':<14} {'Params':<8} {'Disk':<8} {'Prec.':<6} {'Latency (avg)':<15} {'Inference':<12} {'FPS':<7} {'Peak VRAM':<10}")
+    print("-" * 86)
     for r in results:
-        m_str = f" {r['model']:<15} "
-        sz_str = f"{r['imgsz']:<6} "
-        pr_str = f"{r['precision']:<10} "
-        lat_str = f"{r['avg_ms']:.2f} ms".ljust(16)
-        mm_str = f"{r['min_ms']:.1f}/{r['max_ms']:.1f}ms".ljust(16)
-        fps_str = f"{r['fps']:.1f}".ljust(8)
-        print(paint(m_str, BOLD, YELLOW) + sz_str + pr_str + paint(lat_str, BOLD, GREEN) + mm_str + fps_str)
-    print(paint("═" * 76, BOLD, CYAN))
+        m_str   = f" {r['model']:<13} "
+        p_str   = f"{r.get('params_m', 0):.2f}M".ljust(8) if "params_m" in r else "—".ljust(8)
+        sz_str  = f"{r.get('size_mb', 0):.1f}MB".ljust(8) if "size_mb" in r else "—".ljust(8)
+        pr_str  = f"{r['precision']:<6} "
+        lat_str = f"{r['avg_ms']:.2f} ms".ljust(15)
+        inf_str = f"{r.get('inference_ms', r['avg_ms']):.2f} ms".ljust(12)
+        fps_str = f"{r['fps']:.1f}".ljust(7)
+        vr_str  = f"{r['peak_vram_mb']:.1f} MB".ljust(10) if "peak_vram_mb" in r else "—".ljust(10)
+        print(paint(m_str, BOLD, YELLOW) + p_str + sz_str + pr_str + paint(lat_str, BOLD, GREEN) + inf_str + fps_str + paint(vr_str, BOLD, CYAN))
+
+    if track_speed:
+        print("-" * 86)
+        print(paint(" Detailed Speed Breakdown (ms):", BOLD, WHITE))
+        for r in results:
+            if "preprocess_ms" in r:
+                print(
+                    f"   • {paint(r['model'], BOLD, YELLOW)}: Preprocess={r['preprocess_ms']:.2f}ms | Forward={r['inference_ms']:.2f}ms | Postprocess={r['postprocess_ms']:.2f}ms | Total={r['avg_ms']:.2f}ms"
+                )
+    print(paint("═" * 86, BOLD, CYAN))
     print()
     say("success", f"Results saved to: {paint(f'results/{timestamp_str}/', BOLD, GREEN)}")
     say("info", f"  • {run_dir / 'latency_benchmark.json'}")
@@ -1427,7 +1638,7 @@ def action_test_latency(app):
     print()
 
     input(paint("Press Enter to return to menu... ", BOLD, MAGENTA))
-    app.notify("success", f"Latency benchmark completed — saved to results/{timestamp_str}/")
+    app.notify("success", f"Benchmark completed — saved to results/{timestamp_str}/")
 
 
 def action_run_training(app):
@@ -1518,6 +1729,7 @@ def main_items(app):
     cuda_ok, _, gpu_name = get_cuda_status()
     dev_str = f"{dev} ({gpu_name})" if (str(dev).upper().startswith("CUDA") and cuda_ok and gpu_name) else str(dev)
     n_runs = len(_list_result_runs())
+    active_metrics = sum(1 for k, s in METRICS_SCHEMA.items() if s["type"] is bool and app.metrics.get(k, s["default"]))
 
     if n_models == 1:
         model_detail = app.selected_models[0]
@@ -1533,6 +1745,8 @@ def main_items(app):
         Item("Configure shared settings",   lambda a: a.go("configure_shared"),
              detail=dev_str),
         Item("Configure model settings",    lambda a: a.go("model_settings_menu")),
+        Item("Configure tracked metrics",   lambda a: a.go("configure_metrics"),
+             detail=f"{active_metrics} active"),
         Item("Test latency (benchmark)",    lambda a: a.go("test_latency"),
              detail=f"on {dev}"),
         Item("Run training",                lambda a: a.go("run_training")),
@@ -1597,6 +1811,17 @@ def all_settings_items(app):
     # Shared settings
     for key in SHARED_SETTINGS_SCHEMA:
         items.append(shared_setting_item(app, key, with_group=True))
+    # Tracked metrics settings
+    for key, spec in METRICS_SCHEMA.items():
+        val = app.metrics.get(key, spec["default"])
+        detail = ("✔ ON" if val else "✘ OFF") if spec["type"] is bool else str(val)
+        items.append(
+            Item(
+                label=f"Metric: {spec['label']}",
+                action=lambda a, k=key: action_toggle_metric(a, k),
+                detail=detail,
+            )
+        )
     # Link to model specific settings
     for m in get_available_models():
         items.append(
@@ -1661,20 +1886,27 @@ SCREENS = {
         body=model_edit_body,
         items=model_edit_items,
     ),
+    "configure_metrics": Screen(
+        title="Configure tracked metrics",
+        body=metrics_body,
+        items=metrics_items,
+    ),
     "clear_results": Screen(
         title="Clear results",
         body=lambda app: ["Removes saved runs and benchmark outputs."],
         items=lambda app: [Item("Clear results now", action_clear_results)],
     ),
     "test_latency": Screen(
-        title="Test latency",
+        title="Test latency & metrics",
         body=lambda app: [
             f"Active models ({len(app.selected_models)}): {', '.join(app.selected_models)}",
             f"Target device: {app.shared_settings.get('device', 'CUDA:0')}",
-            "Measures warmup and inference response time (ms & FPS) on GPU/CPU.",
+            f"Benchmark parameters: {app.metrics.get('iterations', 20)} iterations, {app.metrics.get('warmup_passes', 5)} warmup passes",
+            "Measures latency, throughput, speed breakdown, model complexity, and GPU VRAM.",
         ],
         items=lambda app: [
-            Item("Run latency test now", action_test_latency),
+            Item("Run benchmark now", action_test_latency),
+            Item("Configure tracked metrics", lambda a: a.go("configure_metrics")),
             Item("Select models to test", lambda a: a.go("select_models")),
             Item("Configure device / shared", lambda a: a.go("configure_shared")),
         ],
