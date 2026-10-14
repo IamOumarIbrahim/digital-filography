@@ -8,15 +8,17 @@ YOLO model selection, and CUDA hardware benchmarking; run it from the project ro
 | Screen | Purpose |
 |---|---|
 | Download dataset | Pick COCO classes, set image count, start download |
+| Resize dataset (640x640) | Central-crop and resize dataset to 640x640 via bilinear interpolation with bounded annotations |
 | Clear dataset | Delete images from a specific class folder (`dataset/<class>/`) or all folders |
 | Select model(s) | Choose one or multiple YOLO models (`yolo26n.pt`, `yolo11n.pt`, `yolov8n.pt`, `yolov10n.pt`, `yolo12n.pt`) |
-| Configure shared settings | Manage shared pipeline settings: compute device (`CUDA:0`), random seed(s), epochs, batch size, learning rate, image size, workers |
-| Configure model settings | Edit model-specific parameters (`conf`, `iou`, `imgsz`, `half` FP16, `max_det`, overrides) per model |
+| Configure shared settings | Manage global pipeline and model settings: compute device (`CUDA:0`), confidence threshold (`conf`), NMS threshold (`iou`), FP16 half-precision (`half`), max detections (`max_det`), evaluation plots (`plots`), COCO JSON export (`save_json`), class-agnostic NMS (`agnostic_nms`), test-time augmentation (`augment`), dataset split (`split`), random seed(s), epochs, batch size, learning rate, image size, workers |
 | Configure tracked metrics | Toggle metrics tracking (speed breakdown, model complexity, GPU VRAM, accuracy) and benchmark iterations |
 | Test latency (benchmark) | Run real-time inference latency benchmark (avg ms, FPS, min/max, VRAM, speed breakdown) on CUDA GPU or CPU |
+| Run tests (evaluation) | Evaluate object detection performance (mAP50, mAP50-95, P, R, F1, speed, plots) directly on dataset without fine-tuning |
 | Run training | Review active models, shared settings, and initiate training pipeline |
 | Clear results | Remove previous run artefacts (`runs/`, `results/`) |
-| All settings | View and edit all shared and model-specific settings from a single place |
+| All settings | View and edit all shared pipeline and metric settings from a single place |
+
 
 ---
 
@@ -33,7 +35,7 @@ Users can select a single model or toggle multiple models simultaneously from th
 ---
 
 ## Configuration (`config/config.json`)
-Settings are clearly separated into `selected_models`, `shared` pipeline settings, `metrics` tracking preferences, and `model_specific` overrides:
+Settings are organized into `selected_models`, `shared` pipeline settings, and `metrics` tracking preferences:
 
 ```json
 {
@@ -43,6 +45,15 @@ Settings are clearly separated into `selected_models`, `shared` pipeline setting
   ],
   "shared": {
     "device": "CUDA:0",
+    "conf": 0.25,
+    "iou": 0.70,
+    "half": false,
+    "max_det": 300,
+    "plots": true,
+    "save_json": false,
+    "agnostic_nms": false,
+    "augment": false,
+    "split": "val",
     "seeds": [0],
     "epochs": 10,
     "batch_size": 32,
@@ -59,58 +70,6 @@ Settings are clearly separated into `selected_models`, `shared` pipeline setting
     "detection_accuracy": true,
     "iterations": 20,
     "warmup_passes": 5
-  },
-  "model_specific": {
-    "yolo26n.pt": {
-      "conf": 0.25,
-      "iou": 0.70,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [0]
-    },
-    "yolo11n.pt": {
-      "conf": 0.25,
-      "iou": 0.70,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [0]
-    },
-    "yolov8n.pt": {
-      "conf": 0.25,
-      "iou": 0.70,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [0]
-    },
-    "yolov10n.pt": {
-      "conf": 0.25,
-      "iou": 0.70,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [0]
-    },
-    "yolo12n.pt": {
-      "conf": 0.25,
-      "iou": 0.70,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [0]
-    }
   }
 }
 ```
@@ -156,15 +115,55 @@ dataset/
 
 ---
 
+## `resize_dataset.py`
+Crops and resizes dataset images to an exact $640 \times 640$ square using bilinear interpolation, with bounding boxes and polygon segmentations updated and clipped to match.
+
+### Crop & Resample Mechanics
+- **Central Crop**: For any image of dimensions $(W, H)$, an aspect-preserving square of side length $S = \min(W, H)$ is extracted from the center at coordinates:
+  $$\text{crop\_x} = \frac{W - S}{2}, \quad \text{crop\_y} = \frac{H - S}{2}$$
+- **Zero Distortion**: No black bars (letterboxing/padding), no stretching or non-uniform scaling.
+- **Resampling**: The cropped square is resized to $640 \times 640$ using PIL Bilinear interpolation (`Image.Resampling.BILINEAR`).
+- **Annotation Bounding**:
+  - Bounding boxes $[x, y, w, h]$ are translated by $-(\text{crop\_x}, \text{crop\_y})$, scaled by $\frac{640}{S}$, and clamped to $[0, 640]$.
+  - Width and height are recalculated; boxes that fall completely outside the crop or end up with dimensions $< 1\text{px}$ are discarded.
+  - Segmentation polygons are transformed, scaled, clamped to $[0, 640]$, and updated.
+  - Image metadata records in `annotations.json` are updated with `width: 640, height: 640`.
+- **Atomic Writes**: Images are written to a `.part` temporary file and renamed atomically to prevent corrupted files if interrupted.
+
+### CLI Usage
+```bash
+# Resize images in dataset/ to 640x640 using 16 worker threads
+python src/resize_dataset.py
+
+# Custom target size or custom thread pool
+python src/resize_dataset.py --size 640 --workers 8
+
+# Target an explicit dataset folder
+python src/resize_dataset.py --dataset-dir dataset/
+```
+
+### Terminal Integration
+Can be triggered directly from the interactive terminal (`python src/run_terminal.py`):
+- From the **Main Menu**: choose `Resize dataset (640x640)`
+- From the **Download dataset** screen: choose `Resize dataset (640x640)`
+
+---
+
 ## Results Directory (`results/<timeofstarting>/`)
-Whenever you execute a benchmark, latency test, or training run, results are automatically organized into:
+Whenever you execute a benchmark, test evaluation, or training run, results are automatically organized into:
 ```
 results/
   YYYY-MM-DD_HH-MM-SS/
     latency_benchmark.json    ← Machine-readable benchmark metrics
     latency_benchmark.txt     ← Formatted benchmark summary table
+    test_results.json         ← Machine-readable model test metrics (mAP50, mAP50-95, P, R, F1, speed)
+    test_summary.txt          ← Formatted evaluation comparison table
+    test_data.yaml            ← Generated dataset YAML configuration for testing
+    val_images.txt            ← Manifest of dataset images evaluated
+    <model_name>/             ← Evaluation plots (confusion matrices, PR curves, batch predictions)
     training_config.json      ← Full configuration snapshot for training runs
     train/                    ← Model checkpoints, curves, and confusion matrices
 ```
 Previous runs can be selectively viewed and deleted through the **Clear results** menu in `run_terminal.py`.
+
 

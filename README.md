@@ -22,7 +22,7 @@
 ```
 filography/
 ├── config/
-│   ├── config.json               # Pipeline configuration (shared & model-specific)
+│   ├── config.json               # Pipeline configuration (shared settings & metrics)
 │   └── instances_val2017.json    # Cached COCO annotations
 ├── dataset/                      # Per-class subfolders with images & annotations
 ├── docs/
@@ -31,6 +31,7 @@ filography/
 ├── results/                      # Timestamped experiment & benchmark outputs
 └── src/
     ├── download_dataset.py       # COCO val2017 per-class dataset downloader
+    ├── resize_dataset.py         # 640x640 bilinear central cropper & annotation bounder
     ├── run_terminal.py           # Interactive menu terminal
     └── README.md                 # Detailed documentation for source scripts
 ```

@@ -8,6 +8,15 @@
   ],
   "shared": {
     "device": "CUDA:0",
+    "conf": 0.5,
+    "iou": 0.7,
+    "half": false,
+    "max_det": 300,
+    "plots": true,
+    "save_json": false,
+    "agnostic_nms": false,
+    "augment": false,
+    "split": "val",
     "epochs": 100,
     "batch_size": 32,
     "learning_rate": 0.001,
@@ -27,72 +36,5 @@
     "detection_accuracy": true,
     "iterations": 20,
     "warmup_passes": 5
-  },
-  "model_specific": {
-    "yolo26n.pt": {
-      "conf": 0.25,
-      "iou": 0.7,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [
-        0
-      ],
-      "seed": 0
-    },
-    "yolo11n.pt": {
-      "conf": 0.25,
-      "iou": 0.7,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [
-        0
-      ],
-      "seed": 0
-    },
-    "yolov8n.pt": {
-      "conf": 0.25,
-      "iou": 0.7,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [
-        0
-      ],
-      "seed": 0
-    },
-    "yolov10n.pt": {
-      "conf": 0.25,
-      "iou": 0.7,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [
-        0
-      ],
-      "seed": 0
-    },
-    "yolo12n.pt": {
-      "conf": 0.25,
-      "iou": 0.7,
-      "imgsz": 640,
-      "half": false,
-      "max_det": 300,
-      "batch_size": 32,
-      "epochs": 10,
-      "seeds": [
-        0
-      ],
-      "seed": 0
-    }
   }
 }

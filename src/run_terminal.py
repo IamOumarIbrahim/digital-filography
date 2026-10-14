@@ -219,6 +219,66 @@ SHARED_SETTINGS_SCHEMA = {
         "type":    str,
         "default": "CUDA:0",
     },
+    "conf": {
+        "group":   "Testing & Inference",
+        "label":   "Confidence threshold (conf)",
+        "type":    float,
+        "default": 0.25,
+        "min":     0.01,
+        "max":     1.0,
+    },
+    "iou": {
+        "group":   "Testing & Inference",
+        "label":   "NMS IoU threshold (iou)",
+        "type":    float,
+        "default": 0.70,
+        "min":     0.01,
+        "max":     1.0,
+    },
+    "half": {
+        "group":   "Testing & Inference",
+        "label":   "FP16 half-precision (half)",
+        "type":    bool,
+        "default": False,
+    },
+    "max_det": {
+        "group":   "Testing & Inference",
+        "label":   "Max detections per image (max_det)",
+        "type":    int,
+        "default": 300,
+        "min":     1,
+        "max":     1000,
+    },
+    "plots": {
+        "group":   "Testing & Inference",
+        "label":   "Save evaluation plots (plots)",
+        "type":    bool,
+        "default": True,
+    },
+    "save_json": {
+        "group":   "Testing & Inference",
+        "label":   "Save COCO format JSON (save_json)",
+        "type":    bool,
+        "default": False,
+    },
+    "agnostic_nms": {
+        "group":   "Testing & Inference",
+        "label":   "Class-agnostic NMS (agnostic_nms)",
+        "type":    bool,
+        "default": False,
+    },
+    "augment": {
+        "group":   "Testing & Inference",
+        "label":   "Test-time augmentation (augment)",
+        "type":    bool,
+        "default": False,
+    },
+    "split": {
+        "group":   "Testing & Inference",
+        "label":   "Dataset split (split)",
+        "type":    str,
+        "default": "val",
+    },
     "epochs": {
         "group":   "Training",
         "label":   "Epochs",
@@ -272,61 +332,6 @@ SHARED_SETTINGS_SCHEMA = {
         "default": 5000,
         "min":     1,
         "max":     5000,
-    },
-}
-
-MODEL_SPECIFIC_SCHEMA = {
-    "conf": {
-        "label":   "Confidence threshold",
-        "type":    float,
-        "default": 0.25,
-        "min":     0.01,
-        "max":     1.0,
-    },
-    "iou": {
-        "label":   "NMS IoU threshold",
-        "type":    float,
-        "default": 0.70,
-        "min":     0.01,
-        "max":     1.0,
-    },
-    "imgsz": {
-        "label":   "Image size override",
-        "type":    int,
-        "default": 640,
-        "min":     128,
-        "max":     1280,
-    },
-    "half": {
-        "label":   "FP16 half-precision",
-        "type":    bool,
-        "default": False,
-    },
-    "max_det": {
-        "label":   "Max detections per image",
-        "type":    int,
-        "default": 300,
-        "min":     1,
-        "max":     1000,
-    },
-    "batch_size": {
-        "label":   "Batch size override",
-        "type":    int,
-        "default": 32,
-        "min":     1,
-        "max":     128,
-    },
-    "epochs": {
-        "label":   "Epochs override",
-        "type":    int,
-        "default": 10,
-        "min":     1,
-        "max":     200,
-    },
-    "seeds": {
-        "label":   "Random seed(s) override",
-        "type":    list,
-        "default": [0],
     },
 }
 
@@ -445,20 +450,11 @@ def parse_value(spec, text):
 # Config Load and Save
 # ---------------------------------------------------------------------------
 
-def default_model_specific_dict():
-    """Build default settings dictionary for all available models."""
-    return {
-        m: {k: spec["default"] for k, spec in MODEL_SPECIFIC_SCHEMA.items()}
-        for m in get_available_models()
-    }
-
-
 def load_settings():
-    """Load settings from config/config.json with shared vs model-specific split."""
+    """Load settings from config/config.json."""
     shared = {k: spec["default"] for k, spec in SHARED_SETTINGS_SCHEMA.items()}
     shared["selected_classes"] = []
     selected_models = ["yolov8n.pt"]
-    model_specific = default_model_specific_dict()
     metrics = {k: spec["default"] for k, spec in METRICS_SCHEMA.items()}
 
     try:
@@ -468,7 +464,6 @@ def load_settings():
             "shared": shared,
             "selected_models": selected_models,
             "metrics": metrics,
-            "model_specific": model_specific,
         }
 
     if not isinstance(saved, dict):
@@ -476,7 +471,6 @@ def load_settings():
             "shared": shared,
             "selected_models": selected_models,
             "metrics": metrics,
-            "model_specific": model_specific,
         }
 
     # 1. Load shared settings
@@ -513,35 +507,7 @@ def load_settings():
         if valid:
             selected_models = valid
 
-    # 3. Load model-specific settings
-    spec_src = saved.get("model_specific", saved.get("model_settings", saved.get("models", {})))
-    if isinstance(spec_src, dict):
-        for m_name, m_cfg in spec_src.items():
-            if isinstance(m_cfg, dict):
-                if m_name not in model_specific:
-                    model_specific[m_name] = {k: s["default"] for k, s in MODEL_SPECIFIC_SCHEMA.items()}
-                for k, spec in MODEL_SPECIFIC_SCHEMA.items():
-                    if k in m_cfg:
-                        val, err = parse_value(spec, m_cfg[k] if isinstance(m_cfg[k], list) else str(m_cfg[k]))
-                        if err is None:
-                            model_specific[m_name][k] = val
-                # Sync model specific seeds
-                raw_m_seeds = m_cfg.get("seeds")
-                if isinstance(raw_m_seeds, list) and raw_m_seeds:
-                    m_parsed = [int(s) for s in raw_m_seeds if str(s).replace("_", "").isdigit() and int(str(s).replace("_", "")) >= 0]
-                    if m_parsed:
-                        model_specific[m_name]["seeds"] = m_parsed
-                        model_specific[m_name]["seed"] = m_parsed[0]
-                elif "seed" in m_cfg:
-                    try:
-                        v = int(m_cfg["seed"])
-                        if v >= 0:
-                            model_specific[m_name]["seeds"] = [v]
-                            model_specific[m_name]["seed"] = v
-                    except (ValueError, TypeError):
-                        pass
-
-    # 4. Load metrics settings
+    # 3. Load metrics settings
     metrics_src = saved.get("metrics")
     if isinstance(metrics_src, dict):
         for k, spec in METRICS_SCHEMA.items():
@@ -554,7 +520,6 @@ def load_settings():
         "shared": shared,
         "selected_models": selected_models,
         "metrics": metrics,
-        "model_specific": model_specific,
     }
 
 
@@ -569,19 +534,11 @@ def save_settings(data):
         data["shared"]["seeds"] = shared_seeds
         data["shared"]["seed"] = shared_seeds[0]
 
-        for m_cfg in data["model_specific"].values():
-            m_s = m_cfg.get("seeds", [0])
-            if not isinstance(m_s, list) or not m_s:
-                m_s = [m_cfg.get("seed", 0)]
-            m_cfg["seeds"] = m_s
-            m_cfg["seed"] = m_s[0]
-
         # Construct clean, organized JSON structure
         payload = {
             "selected_models": data["selected_models"],
             "shared": data["shared"],
             "metrics": data.get("metrics", {k: s["default"] for k, s in METRICS_SCHEMA.items()}),
-            "model_specific": data["model_specific"],
         }
         CONFIG_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:
@@ -600,10 +557,8 @@ class App:
         loaded                = load_settings()
         self.shared_settings  = loaded["shared"]
         self.selected_models  = list(loaded["selected_models"])
-        self.model_settings   = loaded["model_specific"]
         self.metrics          = loaded.get("metrics", {k: s["default"] for k, s in METRICS_SCHEMA.items()})
         self.selected_classes = list(self.shared_settings.get("selected_classes", []))
-        self.editing_model    = None
         self.current          = "main"
         self.back_stack       = []
         self.forward_stack    = []
@@ -617,7 +572,6 @@ class App:
             "selected_models": self.selected_models,
             "shared": self.shared_settings,
             "metrics": self.metrics,
-            "model_specific": self.model_settings,
         }
         return save_settings(payload)
 
@@ -631,10 +585,6 @@ class App:
         self.back_stack.append(self.current)
         self.forward_stack.clear()
         self.current = screen_id
-
-    def go_edit_model(self, model_name):
-        self.editing_model = model_name
-        self.go("configure_model_edit")
 
     def back(self):
         if not self.back_stack:
@@ -802,6 +752,38 @@ def edit_shared_setting(app, key):
             app.notify("error", f"Device verification failed: {exc}")
         return
 
+    if key == "split":
+        print(f"Current split: {paint(current, BOLD, GREEN)}")
+        print()
+        print("Quick options:")
+        print(f"  {paint('1', BOLD, YELLOW)}. val (Validation split - default)")
+        print(f"  {paint('2', BOLD, YELLOW)}. test (Test split)")
+        print(f"  {paint('3', BOLD, YELLOW)}. train (Train split)")
+        print(f"  {paint('4', BOLD, YELLOW)}. Custom split name")
+        print()
+        raw = input(paint("Select option [1-4] or enter custom split (press Enter to cancel): ", BOLD, MAGENTA)).strip()
+        if not raw:
+            app.notify("info", "No changes made.")
+            return
+        if raw == "1":
+            new_val = "val"
+        elif raw == "2":
+            new_val = "test"
+        elif raw == "3":
+            new_val = "train"
+        elif raw == "4":
+            cust = input(paint("Enter split name: ", BOLD, MAGENTA)).strip()
+            if not cust:
+                app.notify("info", "No changes made.")
+                return
+            new_val = cust
+        else:
+            new_val = raw
+        app.shared_settings["split"] = new_val
+        app.save()
+        app.notify("success", f"Dataset split set to '{new_val}'.")
+        return
+
     if spec["type"] is bool:
         app.shared_settings[key] = not current
         app.save()
@@ -837,7 +819,7 @@ def edit_shared_setting(app, key):
 def shared_setting_item(app, key, with_group=False):
     spec = SHARED_SETTINGS_SCHEMA[key]
     label = f"{spec['group']}: {spec['label']}" if with_group else f"Set {spec['label'].lower()}"
-    val = app.shared_settings[key]
+    val = app.shared_settings.get(key, spec["default"])
     detail = format_value(spec, val)
     if key == "device" and str(val).upper().startswith("CUDA"):
         cuda_ok, _, gpu_name = get_cuda_status()
@@ -927,110 +909,6 @@ def model_selection_body(app):
     else:
         lines.append(f"Target compute device: {paint(dev, BOLD, CYAN)} ({cuda_desc})")
     return lines
-
-
-# ---------------------------------------------------------------------------
-# Model-Specific Settings Editing
-# ---------------------------------------------------------------------------
-
-def edit_model_setting(app, model_name: str, key: str):
-    spec = MODEL_SPECIFIC_SCHEMA[key]
-    cfg = app.model_settings.setdefault(model_name, {})
-    current = cfg.get(key, spec["default"])
-    print()
-    print(paint(f"{model_name} → {spec['label']}", BOLD, CYAN))
-
-    if key in ("seeds", "seed"):
-        current_seeds = cfg.get("seeds", [cfg.get("seed", 0)])
-        new_seeds = prompt_multiple_seeds(current_seeds)
-        if new_seeds is None:
-            app.notify("info", "No changes made.")
-            return
-        cfg["seeds"] = new_seeds
-        cfg["seed"] = new_seeds[0]
-        seeds_str = ", ".join(str(s) for s in new_seeds)
-        if app.save():
-            app.notify("success", f"[{model_name}] Random seed(s) set to: {seeds_str} ({len(new_seeds)} active).")
-        else:
-            app.notify("warning", f"[{model_name}] Random seed(s) set, but could not save.")
-        return
-
-    if spec["type"] is bool:
-        cfg[key] = not current
-        app.save()
-        app.notify("success", f"[{model_name}] {spec['label']} toggled to {cfg[key]}.")
-        return
-
-    low  = format_value(spec, spec["min"])
-    high = format_value(spec, spec["max"])
-    cur_fmt = format_value(spec, current)
-    print(f"Allowed range: {low} to {high}. Current value: {cur_fmt}")
-
-    while True:
-        raw = input(paint("New value (press Enter to cancel): ", BOLD, MAGENTA))
-        if not raw.strip():
-            app.notify("info", "No changes made.")
-            return
-        value, error = parse_value(spec, raw)
-        if error:
-            say("warning", error)
-            continue
-        cfg[key] = value
-        app.save()
-        app.notify("success", f"[{model_name}] {spec['label']} set to {format_value(spec, value)}.")
-        return
-
-
-def action_reset_model_settings(app, model_name: str):
-    app.model_settings[model_name] = {k: spec["default"] for k, spec in MODEL_SPECIFIC_SCHEMA.items()}
-    app.save()
-    app.notify("success", f"Reset {model_name} settings to defaults.")
-
-
-def model_edit_items(app):
-    m = app.editing_model or "yolov8n.pt"
-    cfg = app.model_settings.setdefault(m, {})
-    items = []
-    for key, spec in MODEL_SPECIFIC_SCHEMA.items():
-        val = cfg.get(key, spec["default"])
-        items.append(
-            Item(
-                label=f"Set {spec['label'].lower()}",
-                action=lambda a, name=m, k=key: edit_model_setting(a, name, k),
-                detail=format_value(spec, val),
-            )
-        )
-    items.append(Item("Reset this model's settings to default", lambda a, name=m: action_reset_model_settings(a, name)))
-    return items
-
-
-def model_edit_body(app):
-    m = app.editing_model or "yolov8n.pt"
-    status = "Active (Selected)" if m in app.selected_models else "Inactive (Not selected)"
-    color = GREEN if m in app.selected_models else GRAY
-    return [
-        f"Configuring parameters for: {paint(m, BOLD, CYAN)} [{paint(status, BOLD, color)}]",
-        "Changes are saved to 'model_specific' inside config/config.json.",
-    ]
-
-
-def model_list_menu_items(app):
-    items = []
-    for m in get_available_models():
-        cfg = app.model_settings.setdefault(m, {})
-        conf = cfg.get("conf", 0.25)
-        iou = cfg.get("iou", 0.70)
-        imgsz = cfg.get("imgsz", 640)
-        half = cfg.get("half", False)
-        detail_str = f"conf={conf:.2f}, iou={iou:.2f}, sz={imgsz}, fp16={'Y' if half else 'N'}"
-        items.append(
-            Item(
-                label=f"{m} settings",
-                action=lambda a, name=m: a.go_edit_model(name),
-                detail=detail_str,
-            )
-        )
-    return items
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1172,67 @@ def action_clear_dataset(app):
     app.notify("success", msg)
 
 
+def _load_resizer():
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location(
+        "resize_dataset",
+        pathlib.Path(__file__).resolve().parent / "resize_dataset.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def action_resize_dataset(app):
+    """Crop and resize dataset to 640x640 using bilinear interpolation with bounded annotations."""
+    if not DATASET_DIR.exists():
+        app.notify("warning", "The dataset folder does not exist. Please download a dataset first.")
+        return
+
+    n_images = _count_all_images()
+    if n_images == 0:
+        app.notify("warning", "No images found in dataset/. Please download a dataset first.")
+        return
+
+    workers = app.shared_settings.get("workers", 16)
+    target_size = 640
+
+    print()
+    print(paint("Crop & Resize Dataset (640x640 Bilinear)", BOLD, CYAN))
+    print()
+    print(f"  • Target resolution: {paint(f'{target_size}x{target_size}', BOLD, GREEN)} (square)")
+    print(f"  • Resampling:        {paint('Bilinear interpolation (Image.Resampling.BILINEAR)', BOLD, WHITE)}")
+    print(f"  • Crop type:         {paint('Central crop (no black bars, no distortion/stretching)', BOLD, WHITE)}")
+    print(f"  • Annotations:       {paint('Bounded and clipped to the 640x640 square', BOLD, GREEN)}")
+    print(f"  • Images found:      {paint(f'{n_images:,} images', BOLD, YELLOW)} across dataset folders")
+    print(f"  • Worker threads:    {paint(str(workers), BOLD, WHITE)}")
+    print()
+
+    if not confirm("Proceed with central cropping and resizing dataset to 640x640?"):
+        app.notify("info", "Resizing cancelled.")
+        return
+
+    try:
+        mod = _load_resizer()
+        summary = mod.resize_dataset(dataset_dir=DATASET_DIR, target_size=target_size, workers=workers)
+        r, s, f = summary["images_resized"], summary["images_skipped"], len(summary["failed"])
+        ann_stats = summary.get("annotations", {})
+        k = ann_stats.get("kept", 0)
+        d = ann_stats.get("dropped", 0)
+
+        msg = f"Resized {r:,} image(s), {s:,} skipped, {k:,} annotations kept ({d:,} dropped)"
+        if f:
+            msg += f", {f:,} failed"
+            app.notify("warning", msg)
+        else:
+            app.notify("success", msg)
+    except KeyboardInterrupt:
+        app.notify("warning", "Resizing interrupted.")
+    except Exception as exc:  # noqa: BLE001
+        app.notify("error", f"Resizing failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Results & Benchmarks Actions
 # ---------------------------------------------------------------------------
@@ -1447,11 +1386,10 @@ def action_test_latency(app):
             continue
 
         say("info", f"Benchmarking {paint(model_name, BOLD, CYAN)}...")
-        m_cfg = app.model_settings.get(model_name, {})
-        img_size = m_cfg.get("imgsz", app.shared_settings.get("imgsz", 640))
-        half_precision = m_cfg.get("half", False) and cuda_active
-        conf = m_cfg.get("conf", 0.25)
-        iou = m_cfg.get("iou", 0.70)
+        img_size = app.shared_settings.get("imgsz", 640)
+        half_precision = app.shared_settings.get("half", False) and cuda_active
+        conf = app.shared_settings.get("conf", 0.25)
+        iou = app.shared_settings.get("iou", 0.70)
 
         try:
             model = YOLO(str(model_path))
@@ -1641,6 +1579,392 @@ def action_test_latency(app):
     app.notify("success", f"Benchmark completed — saved to results/{timestamp_str}/")
 
 
+def _find_all_image_paths() -> list[Path]:
+    """Return all .jpg and .jpeg images in dataset/."""
+    if not DATASET_DIR.exists():
+        return []
+    return sorted(set(list(DATASET_DIR.rglob("*.jpg")) + list(DATASET_DIR.rglob("*.jpeg"))))
+
+
+def _prepare_yolo_labels_and_dataset(
+    images: list[Path],
+    run_dir: Path,
+    dataset_dir: Path,
+    class_names: dict[int, str],
+) -> Path:
+    """Ensure YOLO txt format labels exist for all images and create dataset YAML."""
+    name_to_yolo_id = {v: k for k, v in class_names.items()}
+
+    missing_labels = [img for img in images if not img.with_suffix(".txt").exists()]
+    if missing_labels:
+        say("info", f"Generating YOLO label files for {len(missing_labels):,} image(s)...")
+        # Load COCO annotations: check dataset/annotations.json, subfolders, or cached COCO
+        coco_sources = []
+        if (dataset_dir / "annotations.json").exists():
+            coco_sources.append(dataset_dir / "annotations.json")
+        for sub in dataset_dir.iterdir():
+            if sub.is_dir() and (sub / "annotations.json").exists() and (sub / "annotations.json") not in coco_sources:
+                coco_sources.append(sub / "annotations.json")
+        if not coco_sources and ANNOTATIONS_CACHE.exists():
+            coco_sources.append(ANNOTATIONS_CACHE)
+
+        img_name_to_id: dict[str, int] = {}
+        img_id_to_dim: dict[int, tuple[int, int]] = {}
+        img_id_to_annos: dict[int, list[dict]] = {}
+        coco_id_to_yolo_id: dict[int, int] = {}
+
+        for src in coco_sources:
+            try:
+                data = json.loads(src.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+
+            for cat in data.get("categories", []):
+                cname = cat.get("name")
+                cid = cat.get("id")
+                if cname in name_to_yolo_id and cid is not None:
+                    coco_id_to_yolo_id[cid] = name_to_yolo_id[cname]
+
+            for img in data.get("images", []):
+                fname = img.get("file_name")
+                iid = img.get("id")
+                w = img.get("width")
+                h = img.get("height")
+                if fname and iid is not None:
+                    img_name_to_id[fname] = iid
+                    if w and h:
+                        img_id_to_dim[iid] = (int(w), int(h))
+
+            for a in data.get("annotations", []):
+                iid = a.get("image_id")
+                if iid is not None:
+                    img_id_to_annos.setdefault(iid, []).append(a)
+
+        from PIL import Image
+        for img_path in missing_labels:
+            txt_path = img_path.with_suffix(".txt")
+            fname = img_path.name
+            iid = img_name_to_id.get(fname)
+            lines = []
+            if iid is not None and iid in img_id_to_annos:
+                dim = img_id_to_dim.get(iid)
+                if not dim:
+                    try:
+                        with Image.open(img_path) as im:
+                            dim = im.size
+                    except OSError:
+                        dim = (640, 640)
+                w_img, h_img = dim
+                for a in img_id_to_annos[iid]:
+                    cid = a.get("category_id")
+                    if cid in coco_id_to_yolo_id and "bbox" in a:
+                        y_id = coco_id_to_yolo_id[cid]
+                        bx, by, bw, bh = a["bbox"]
+                        if bw >= 1 and bh >= 1:
+                            xc = max(0.0, min(1.0, (bx + bw / 2.0) / w_img))
+                            yc = max(0.0, min(1.0, (by + bh / 2.0) / h_img))
+                            nw = max(0.0, min(1.0, bw / w_img))
+                            nh = max(0.0, min(1.0, bh / h_img))
+                            lines.append(f"{y_id} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}")
+            txt_path.write_text("\n".join(lines), encoding="utf-8")
+
+    val_txt_path = run_dir / "val_images.txt"
+    val_lines = [str(p).replace("\\", "/") for p in images]
+    val_txt_path.write_text("\n".join(val_lines) + "\n", encoding="utf-8")
+
+    import yaml
+    data_yaml_path = run_dir / "test_data.yaml"
+    yaml_payload = {
+        "path": str(dataset_dir).replace("\\", "/"),
+        "train": str(val_txt_path).replace("\\", "/"),
+        "val": str(val_txt_path).replace("\\", "/"),
+        "test": str(val_txt_path).replace("\\", "/"),
+        "names": class_names,
+    }
+    with open(data_yaml_path, "w", encoding="utf-8") as f:
+        yaml.dump(yaml_payload, f)
+
+    return data_yaml_path
+
+
+def action_run_tests(app):
+    """Run model validation and testing on dataset without fine-tuning, saving to results/[timeofstarting]/."""
+    target_models = app.selected_models or [get_available_models()[0]]
+    raw_device = app.shared_settings.get("device", "CUDA:0")
+    seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+    set_seed(seeds[0])
+    start_time = datetime.now().astimezone()
+    timestamp_str = start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = get_results_dir() / timestamp_str
+
+    images = _find_all_image_paths()
+    if not images:
+        app.notify("warning", "No images found in dataset/. Please run 'Download dataset' first.")
+        return
+
+    try:
+        resolved_device = resolve_device(raw_device)
+    except Exception as exc:  # noqa: BLE001
+        app.notify("error", f"Device resolution failed: {exc}")
+        return
+
+    cuda_active = resolved_device.startswith("cuda")
+    device_desc = resolved_device
+    if cuda_active:
+        import torch
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        device_desc = f"{raw_device} → {resolved_device} [{gpu_name}]"
+
+    split = app.shared_settings.get("split", "val")
+    track_speed = app.metrics.get("speed_breakdown", True)
+    track_complexity = app.metrics.get("model_complexity", True)
+    track_vram = app.metrics.get("vram_usage", True) and cuda_active
+
+    print()
+    print(paint("═" * 98, BOLD, CYAN))
+    print(paint(" MODEL EVALUATION & TESTING (WITHOUT FINE-TUNING)", BOLD, WHITE))
+    print(paint("═" * 98, BOLD, CYAN))
+    print(f"  • Models to test:     {paint(', '.join(target_models), BOLD, YELLOW)} ({len(target_models)} models)")
+    print(f"  • Target device:      {paint(device_desc, BOLD, GREEN)}")
+    print(f"  • Dataset images:     {paint(f'{len(images):,} images', BOLD, GREEN)} in dataset/")
+    print(f"  • Split:              {paint(split, BOLD, WHITE)}")
+    print(f"  • Random seed:        {paint(str(seeds[0]), BOLD, GREEN)}")
+    print(f"  • Output directory:   {paint(f'results/{timestamp_str}/', BOLD, CYAN)}")
+    print(paint("═" * 98, BOLD, CYAN))
+    print()
+
+    if not confirm(f"Run test evaluation on {len(target_models)} model(s) with {resolved_device}?"):
+        app.notify("info", "Test evaluation cancelled.")
+        return
+
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        app.notify("error", f"Missing dependency: {exc}. Please ensure 'ultralytics' is installed.")
+        return
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load first model to retrieve class names
+    sample_model_name = target_models[0]
+    sample_path = MODELS_DIR / sample_model_name
+    if not sample_path.exists():
+        app.notify("error", f"Model file '{sample_model_name}' not found in {MODELS_DIR}.")
+        return
+
+    say("info", "Preparing dataset and ground-truth labels for YOLO evaluation...")
+    sample_model = YOLO(str(sample_path))
+    class_names = getattr(sample_model, "names", {i: c for i, c in enumerate(COCO_CLASSES)})
+    data_yaml_path = _prepare_yolo_labels_and_dataset(images, run_dir, DATASET_DIR, class_names)
+    say("success", f"Dataset YAML created: {paint(str(data_yaml_path.name), BOLD, GREEN)}")
+
+    results = []
+    for model_name in target_models:
+        model_path = MODELS_DIR / model_name
+        if not model_path.exists():
+            say("warning", f"Model file '{model_name}' not found in {MODELS_DIR}. Skipping.")
+            continue
+
+        model_stem = model_name.replace(".pt", "")
+        say("info", f"Evaluating {paint(model_name, BOLD, CYAN)} on {len(images):,} images...")
+
+        img_size = app.shared_settings.get("imgsz", 640)
+        half_precision = app.shared_settings.get("half", False) and cuda_active
+        conf = app.shared_settings.get("conf", 0.25)
+        iou = app.shared_settings.get("iou", 0.70)
+        max_det = app.shared_settings.get("max_det", 300)
+        batch_size = app.shared_settings.get("batch_size", 32)
+        workers = app.shared_settings.get("workers", 8)
+        plots = app.shared_settings.get("plots", True)
+        save_json = app.shared_settings.get("save_json", False)
+        augment = app.shared_settings.get("augment", False)
+        agnostic_nms = app.shared_settings.get("agnostic_nms", False)
+
+        try:
+            model = YOLO(str(model_path))
+
+            params_m = None
+            size_mb = None
+            if track_complexity:
+                if hasattr(model, "model") and hasattr(model.model, "parameters"):
+                    params_m = sum(p.numel() for p in model.model.parameters()) / 1e6
+                if model_path.exists():
+                    size_mb = model_path.stat().st_size / (1024 * 1024)
+
+            if track_vram and cuda_active:
+                import torch
+                torch.cuda.reset_peak_memory_stats()
+
+            # Execute model validation/test
+            val_out = model.val(
+                data=str(data_yaml_path),
+                split=split,
+                batch=batch_size,
+                imgsz=img_size,
+                device=resolved_device,
+                conf=conf,
+                iou=iou,
+                half=half_precision,
+                max_det=max_det,
+                workers=workers,
+                plots=plots,
+                save_json=save_json,
+                augment=augment,
+                agnostic_nms=agnostic_nms,
+                project=str(run_dir),
+                name=model_stem,
+                exist_ok=True,
+                verbose=False,
+            )
+
+            # Extract metrics
+            map50_95 = float(val_out.box.map) if hasattr(val_out, "box") else 0.0
+            map50 = float(val_out.box.map50) if hasattr(val_out, "box") else 0.0
+            map75 = float(getattr(val_out.box, "map75", 0.0)) if hasattr(val_out, "box") else 0.0
+            prec = float(val_out.box.mp) if hasattr(val_out, "box") else 0.0
+            rec = float(val_out.box.mr) if hasattr(val_out, "box") else 0.0
+            f1 = float(2 * prec * rec / (prec + rec + 1e-9))
+
+            speed = getattr(val_out, "speed", {})
+            inf_ms = float(speed.get("inference", 0.0))
+            pre_ms = float(speed.get("preprocess", 0.0))
+            post_ms = float(speed.get("postprocess", 0.0))
+            tot_ms = pre_ms + inf_ms + post_ms
+            fps = 1000.0 / tot_ms if tot_ms > 0 else 0.0
+
+            peak_vram = None
+            if track_vram and cuda_active:
+                import torch
+                peak_vram = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+            entry = {
+                "model": model_name,
+                "precision": "FP16" if half_precision else "FP32",
+                "map50_95": map50_95,
+                "map50": map50,
+                "map75": map75,
+                "precision_score": prec,
+                "recall_score": rec,
+                "f1_score": f1,
+                "inference_ms": inf_ms,
+                "preprocess_ms": pre_ms,
+                "postprocess_ms": post_ms,
+                "total_ms": tot_ms,
+                "fps": fps,
+                "imgsz": img_size,
+                "conf": conf,
+                "iou": iou,
+                "plots_saved": plots,
+            }
+            if params_m is not None:
+                entry["params_m"] = params_m
+                entry["size_mb"] = size_mb
+            if peak_vram is not None:
+                entry["peak_vram_mb"] = peak_vram
+
+            results.append(entry)
+            say("success", f"[{model_name}] mAP50={map50:.3f} | mAP50-95={map50_95:.3f} | F1={f1:.3f} | Inf={inf_ms:.1f}ms ({fps:.1f} FPS)")
+        except KeyboardInterrupt:
+            say("warning", f"Testing interrupted on {model_name}.")
+            break
+        except Exception as exc:  # noqa: BLE001
+            say("error", f"Error testing {model_name}: {exc}")
+
+    if not results:
+        app.notify("warning", "No models were successfully evaluated.")
+        return
+
+    # Save test_results.json
+    test_payload = {
+        "timestamp_start": start_time.isoformat(),
+        "folder": timestamp_str,
+        "device_config": raw_device,
+        "resolved_device": resolved_device,
+        "device_description": device_desc,
+        "dataset_images": len(images),
+        "split": split,
+        "seeds": seeds,
+        "seed": seeds[0],
+        "shared_settings": app.shared_settings,
+        "results": results,
+    }
+    (run_dir / "test_results.json").write_text(json.dumps(test_payload, indent=2) + "\n", encoding="utf-8")
+
+    # Save test_summary.txt
+    summary_lines = [
+        "═" * 98,
+        f" MODEL EVALUATION & TEST REPORT ({device_desc})",
+        f" Evaluated on {len(images):,} images | Split: {split} | Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "═" * 98,
+        f" {'Model':<13} {'Params':<8} {'Prec.':<6} {'mAP50':<8} {'mAP50-95':<10} {'P(box)':<8} {'R(box)':<8} {'F1':<7} {'Inference':<11} {'FPS':<7} {'Peak VRAM':<10}",
+        "-" * 98,
+    ]
+    for r in results:
+        m_str   = f" {r['model']:<12} "
+        p_str   = f"{r.get('params_m', 0):.2f}M".ljust(8) if "params_m" in r else "—".ljust(8)
+        pr_str  = f"{r['precision']:<6} "
+        m50_str = f"{r['map50']:.3f}".ljust(8)
+        m_str95 = f"{r['map50_95']:.3f}".ljust(10)
+        pc_str  = f"{r['precision_score']:.3f}".ljust(8)
+        rc_str  = f"{r['recall_score']:.3f}".ljust(8)
+        f1_str  = f"{r['f1_score']:.3f}".ljust(7)
+        inf_str = f"{r['inference_ms']:.1f} ms".ljust(11)
+        fps_str = f"{r['fps']:.1f}".ljust(7)
+        vr_str  = f"{r['peak_vram_mb']:.1f} MB".ljust(10) if "peak_vram_mb" in r else "—".ljust(10)
+        summary_lines.append(m_str + p_str + pr_str + m50_str + m_str95 + pc_str + rc_str + f1_str + inf_str + fps_str + vr_str)
+
+    if track_speed:
+        summary_lines.append("-" * 98)
+        summary_lines.append(" Detailed Speed Breakdown (Averages in ms):")
+        for r in results:
+            summary_lines.append(
+                f"   • {r['model']:<14}: Preprocess={r['preprocess_ms']:.2f}ms | Forward={r['inference_ms']:.2f}ms | Postprocess={r['postprocess_ms']:.2f}ms | Total={r['total_ms']:.2f}ms"
+            )
+    summary_lines.append("═" * 98)
+    (run_dir / "test_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    # Print summary table to console
+    print()
+    print(paint("═" * 98, BOLD, CYAN))
+    print(paint(f" MODEL EVALUATION & TEST REPORT ({device_desc})", BOLD, WHITE))
+    print(paint(f" Evaluated on {len(images):,} images | Split: {split} | Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}", DIM))
+    print(paint("═" * 98, BOLD, CYAN))
+    print(f" {'Model':<13} {'Params':<8} {'Prec.':<6} {'mAP50':<8} {'mAP50-95':<10} {'P(box)':<8} {'R(box)':<8} {'F1':<7} {'Inference':<11} {'FPS':<7} {'Peak VRAM':<10}")
+    print("-" * 98)
+    for r in results:
+        m_str   = f" {r['model']:<12} "
+        p_str   = f"{r.get('params_m', 0):.2f}M".ljust(8) if "params_m" in r else "—".ljust(8)
+        pr_str  = f"{r['precision']:<6} "
+        m50_str = f"{r['map50']:.3f}".ljust(8)
+        m_str95 = f"{r['map50_95']:.3f}".ljust(10)
+        pc_str  = f"{r['precision_score']:.3f}".ljust(8)
+        rc_str  = f"{r['recall_score']:.3f}".ljust(8)
+        f1_str  = f"{r['f1_score']:.3f}".ljust(7)
+        inf_str = f"{r['inference_ms']:.1f} ms".ljust(11)
+        fps_str = f"{r['fps']:.1f}".ljust(7)
+        vr_str  = f"{r['peak_vram_mb']:.1f} MB".ljust(10) if "peak_vram_mb" in r else "—".ljust(10)
+        print(paint(m_str, BOLD, YELLOW) + p_str + pr_str + paint(m50_str, BOLD, GREEN) + paint(m_str95, BOLD, GREEN) + pc_str + rc_str + f1_str + inf_str + fps_str + paint(vr_str, BOLD, CYAN))
+
+    if track_speed:
+        print("-" * 98)
+        print(paint(" Detailed Speed Breakdown (ms):", BOLD, WHITE))
+        for r in results:
+            print(
+                f"   • {paint(r['model'], BOLD, YELLOW)}: Preprocess={r['preprocess_ms']:.2f}ms | Forward={r['inference_ms']:.2f}ms | Postprocess={r['postprocess_ms']:.2f}ms | Total={r['total_ms']:.2f}ms"
+            )
+    print(paint("═" * 98, BOLD, CYAN))
+    print()
+    say("success", f"Results saved to: {paint(f'results/{timestamp_str}/', BOLD, GREEN)}")
+    say("info", f"  • {run_dir / 'test_results.json'}")
+    say("info", f"  • {run_dir / 'test_summary.txt'}")
+    if any(r.get("plots_saved") for r in results):
+        say("info", f"  • Evaluation plots & PR curves saved in {run_dir}/<model>/")
+    print()
+
+    input(paint("Press Enter to return to menu... ", BOLD, MAGENTA))
+    app.notify("success", f"Test evaluation completed — saved to results/{timestamp_str}/")
+
+
 def action_run_training(app):
     """Check dataset, device and trigger training pipeline, saving to results/[timeofstarting]/."""
     target_models = app.selected_models or [get_available_models()[0]]
@@ -1682,10 +2006,9 @@ def action_run_training(app):
     print()
     print(paint("Selected models for training / fine-tuning:", BOLD, CYAN))
     for m in target_models:
-        m_cfg = app.model_settings.get(m, {})
-        ep = m_cfg.get("epochs", app.shared_settings["epochs"])
-        bs = m_cfg.get("batch_size", app.shared_settings["batch_size"])
-        sz = m_cfg.get("imgsz", app.shared_settings["imgsz"])
+        ep = app.shared_settings["epochs"]
+        bs = app.shared_settings["batch_size"]
+        sz = app.shared_settings["imgsz"]
         print(f"  • {paint(m, BOLD, YELLOW)}: epochs={ep}, batch_size={bs}, imgsz={sz}")
     print()
 
@@ -1706,7 +2029,6 @@ def action_run_training(app):
         "seed": seeds[0],
         "shared_settings": app.shared_settings,
         "selected_models": target_models,
-        "model_specific": {m: app.model_settings.get(m, {}) for m in target_models},
         "dataset_images": n_images,
     }
     (run_dir / "training_config.json").write_text(
@@ -1738,17 +2060,20 @@ def main_items(app):
 
     return [
         Item("Download dataset",            lambda a: a.go("download_dataset")),
+        Item("Resize dataset (640x640)",    action_resize_dataset,
+             detail="central crop"),
         Item("Clear dataset",               lambda a: a.go("clear_dataset"),
              detail=f"{total:,} images" if total else "empty"),
         Item("Select model(s)",             lambda a: a.go("select_models"),
              detail=model_detail),
         Item("Configure shared settings",   lambda a: a.go("configure_shared"),
              detail=dev_str),
-        Item("Configure model settings",    lambda a: a.go("model_settings_menu")),
         Item("Configure tracked metrics",   lambda a: a.go("configure_metrics"),
              detail=f"{active_metrics} active"),
         Item("Test latency (benchmark)",    lambda a: a.go("test_latency"),
              detail=f"on {dev}"),
+        Item("Run tests (eval without training)", lambda a: a.go("run_tests"),
+             detail=f"{n_models} model(s)"),
         Item("Run training",                lambda a: a.go("run_training")),
         Item("Clear results",               lambda a: a.go("clear_results"),
              detail=f"{n_runs} run(s)" if n_runs else "empty"),
@@ -1781,10 +2106,12 @@ def download_body(app):
 def download_items(app):
     n = len(app.selected_classes)
     return [
-        Item("Choose classes",   lambda a: a.go("select_classes"),
+        Item("Choose classes",          lambda a: a.go("select_classes"),
              detail=f"{n} selected" if n else "none (all images)"),
         shared_setting_item(app, "num_images"),
-        Item("Start download",   action_start_download),
+        Item("Start download",          action_start_download),
+        Item("Resize dataset (640x640)", action_resize_dataset,
+             detail="central crop"),
     ]
 
 
@@ -1806,6 +2133,40 @@ def run_training_body(app):
     return lines
 
 
+def run_tests_body(app):
+    n_models = len(app.selected_models)
+    dev = app.shared_settings.get("device", "CUDA:0")
+    cuda_ok, _, gpu_name = get_cuda_status()
+    dev_str = f"{dev} [{gpu_name}]" if (str(dev).upper().startswith("CUDA") and cuda_ok and gpu_name) else str(dev)
+    n_images = _count_all_images()
+    split = app.shared_settings.get("split", "val")
+    conf = app.shared_settings.get("conf", 0.25)
+    iou = app.shared_settings.get("iou", 0.70)
+    sz = app.shared_settings.get("imgsz", 640)
+    half = app.shared_settings.get("half", False)
+    plots = app.shared_settings.get("plots", True)
+    seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+
+    lines = [
+        "Evaluate object detection performance directly on dataset without fine-tuning.",
+        f"  • Selected model(s) ({n_models}): {paint(', '.join(app.selected_models), BOLD, CYAN)}",
+        f"  • Compute target:           {paint(dev_str, BOLD, GREEN)}",
+        f"  • Dataset images:           {paint(f'{n_images:,} images', BOLD, YELLOW)} in dataset/",
+        f"  • Global parameters:        imgsz={sz}, conf={conf}, iou={iou}, fp16={'Yes' if half else 'No'}, split={split}",
+        f"  • Plots generation:         {'Enabled (confusion matrix, PR curves, batches)' if plots else 'Disabled'}",
+        f"  • Random seed(s):           {', '.join(str(s) for s in seeds)}",
+    ]
+    return lines
+
+
+def run_tests_items(app):
+    return [
+        Item("Start test evaluation now",   action_run_tests),
+        Item("Select models to test",       lambda a: a.go("select_models")),
+        Item("Configure global settings",   lambda a: a.go("configure_shared")),
+    ]
+
+
 def all_settings_items(app):
     items = []
     # Shared settings
@@ -1820,15 +2181,6 @@ def all_settings_items(app):
                 label=f"Metric: {spec['label']}",
                 action=lambda a, k=key: action_toggle_metric(a, k),
                 detail=detail,
-            )
-        )
-    # Link to model specific settings
-    for m in get_available_models():
-        items.append(
-            Item(
-                label=f"Model: {m} settings",
-                action=lambda a, name=m: a.go_edit_model(name),
-                detail="configure",
             )
         )
     return items
@@ -1868,23 +2220,10 @@ SCREENS = {
     "configure_shared": Screen(
         title="Configure shared settings",
         body=lambda app: [
-            "Shared parameters applied to all models and operations.",
-            "Device setting 'CUDA:0' automatically utilizes CUDA GPU.",
+            "Global pipeline, model, and hardware settings.",
+            "Model parameters (conf, iou, half, max_det, plots, etc.) apply to all models.",
         ],
         items=lambda app: [shared_setting_item(app, key) for key in SHARED_SETTINGS_SCHEMA],
-    ),
-    "model_settings_menu": Screen(
-        title="Model-specific settings",
-        body=lambda app: [
-            "Choose a model below to configure its individual parameters",
-            "(confidence threshold, IoU threshold, FP16 half-precision, etc.).",
-        ],
-        items=model_list_menu_items,
-    ),
-    "configure_model_edit": Screen(
-        title="Model configuration",
-        body=model_edit_body,
-        items=model_edit_items,
     ),
     "configure_metrics": Screen(
         title="Configure tracked metrics",
@@ -1911,6 +2250,11 @@ SCREENS = {
             Item("Configure device / shared", lambda a: a.go("configure_shared")),
         ],
     ),
+    "run_tests": Screen(
+        title="Run tests (evaluation)",
+        body=run_tests_body,
+        items=run_tests_items,
+    ),
     "run_training": Screen(
         title="Run training",
         body=run_training_body,
@@ -1918,7 +2262,6 @@ SCREENS = {
             Item("Start training session",   action_run_training),
             Item("Select models",            lambda a: a.go("select_models")),
             Item("Change shared settings",   lambda a: a.go("configure_shared")),
-            Item("Configure model settings", lambda a: a.go("model_settings_menu")),
         ],
     ),
     "all_settings": Screen(
