@@ -19,3 +19,30 @@
 
 ## Project Structure
 
+```
+filography/
+├── config/
+│   ├── config.json               # Pipeline configuration (shared & model-specific)
+│   └── instances_val2017.json    # Cached COCO annotations
+├── dataset/                      # Per-class subfolders with images & annotations
+├── docs/
+│   └── main.pdf                  # Research paper
+├── models/                       # YOLO model weights (yolov8n, yolo11n, yolo12n, yolo26n, yolov10n)
+├── results/                      # Timestamped experiment & benchmark outputs
+└── src/
+    ├── download_dataset.py       # COCO val2017 per-class dataset downloader
+    ├── run_terminal.py           # Interactive menu terminal
+    └── README.md                 # Detailed documentation for source scripts
+```
+
+## Quickstart
+
+Launch the interactive terminal:
+```bash
+python src/run_terminal.py
+```
+
+Download a dataset with specific COCO classes:
+```bash
+python src/download_dataset.py -n 300 --classes dog person cat
+```

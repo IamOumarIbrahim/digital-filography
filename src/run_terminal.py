@@ -1,5 +1,5 @@
-﻿#!/usr/bin/env python3
-"""Menu based terminal for the training project.
+#!/usr/bin/env python3
+"""Menu based terminal for dataset management and YOLO model workflows.
 
 Start it from the project root:
     python src/run_terminal.py
@@ -11,16 +11,18 @@ Keys that work on every screen:
     h            go to the main menu
     q            quit
 
-Settings are saved to config/config.json, so your other
-scripts (download_dataset.py and so on) can read them.
+Settings are saved to config/config.json, with clean separation between
+shared pipeline settings and model-specific parameters.
 """
 
 import json
 import os
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -29,7 +31,33 @@ from typing import Callable
 PROJECT_ROOT      = Path(__file__).resolve().parent.parent
 CONFIG_PATH       = PROJECT_ROOT / "config" / "config.json"
 DATASET_DIR       = PROJECT_ROOT / "dataset"
+MODELS_DIR        = PROJECT_ROOT / "models"
+RESULTS_DIR       = PROJECT_ROOT / "results"
+RUNS_DIR          = PROJECT_ROOT / "runs"
 ANNOTATIONS_CACHE = PROJECT_ROOT / "config" / "instances_val2017.json"
+
+# ---------------------------------------------------------------------------
+# YOLO Models catalogue
+# ---------------------------------------------------------------------------
+
+AVAILABLE_MODELS = (
+    "yolo26n.pt",
+    "yolo11n.pt",
+    "yolov8n.pt",
+    "yolov10n.pt",
+    "yolo12n.pt",
+)
+
+
+def get_available_models() -> list[str]:
+    """Return available models in models/ directory, keeping catalog order."""
+    found = set()
+    if MODELS_DIR.exists():
+        found = {f.name for f in MODELS_DIR.glob("*.pt")}
+    catalog = [m for m in AVAILABLE_MODELS if m in found or not found]
+    extra = sorted(found - set(AVAILABLE_MODELS))
+    return catalog + extra
+
 
 # ---------------------------------------------------------------------------
 # COCO class catalogue (val2017 - 80 categories, alphabetical)
@@ -53,6 +81,63 @@ COCO_CLASSES = (
     "toilet",        "toothbrush",    "traffic light", "train",         "truck",
     "tv",            "umbrella",      "vase",          "wine glass",    "zebra",
 )
+
+# ---------------------------------------------------------------------------
+# CUDA / Device resolution
+# ---------------------------------------------------------------------------
+
+def get_cuda_status():
+    """Return (is_available, description, device_name)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            name = torch.cuda.get_device_name(0)
+            return True, f"CUDA available ({count} GPU(s))", name
+        return False, "CUDA not available (CPU only)", None
+    except ImportError:
+        return False, "PyTorch not installed", None
+    except Exception as exc:  # noqa: BLE001
+        return False, f"CUDA error: {exc}", None
+
+
+def resolve_device(device_str: str = "CUDA:0") -> str:
+    """Normalize device string and ensure CUDA:0 actually resolves to CUDA device.
+
+    PyTorch requires lowercase 'cuda:0' or 'cuda' (uppercase 'CUDA:0' causes an error
+    in torch.device). If CUDA:0 or any cuda device is requested:
+      - Validates torch.cuda.is_available()
+      - Selects the target GPU index with torch.cuda.set_device()
+      - Returns lowercase 'cuda:<index>'
+    """
+    raw = str(device_str).strip()
+    lower = raw.lower()
+    if lower.startswith("cuda") or lower.isdigit():
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError("PyTorch is required to use CUDA device.")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Device '{device_str}' requested, but CUDA is not available in PyTorch. "
+                "Please verify NVIDIA drivers and CUDA PyTorch installation."
+            )
+        if lower.isdigit():
+            idx = int(lower)
+        else:
+            parts = lower.split(":")
+            idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if idx >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {idx} requested ('{device_str}'), but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are available."
+            )
+        torch.cuda.set_device(idx)
+        return f"cuda:{idx}"
+    elif lower == "cpu":
+        return "cpu"
+    return lower
+
 
 # ---------------------------------------------------------------------------
 # Terminal setup
@@ -124,19 +209,15 @@ def confirm(question, default=False):
 
 
 # ---------------------------------------------------------------------------
-# Settings
+# Settings Schema
 # ---------------------------------------------------------------------------
-# To add a new numeric setting, add one entry here. It will appear on its
-# group screen and on the "All settings" screen automatically.
 
-SETTINGS = {
-    "num_images": {
-        "group":   "Dataset",
-        "label":   "Number of images",
-        "type":    int,
-        "default": 1000,
-        "min":     1,
-        "max":     5_000,   # COCO val2017 has 5 000 images; matches MAX_IMAGES in download_dataset.py
+SHARED_SETTINGS_SCHEMA = {
+    "device": {
+        "group":   "Hardware",
+        "label":   "Compute device",
+        "type":    str,
+        "default": "CUDA:0",
     },
     "epochs": {
         "group":   "Training",
@@ -152,7 +233,7 @@ SETTINGS = {
         "type":    int,
         "default": 32,
         "min":     1,
-        "max":     64,
+        "max":     128,
     },
     "learning_rate": {
         "group":   "Training",
@@ -162,69 +243,297 @@ SETTINGS = {
         "min":     0.000001,
         "max":     1.0,
     },
+    "imgsz": {
+        "group":   "Pipeline",
+        "label":   "Image size (imgsz)",
+        "type":    int,
+        "default": 640,
+        "min":     128,
+        "max":     1280,
+    },
+    "workers": {
+        "group":   "Pipeline",
+        "label":   "Worker threads",
+        "type":    int,
+        "default": 8,
+        "min":     1,
+        "max":     32,
+    },
+    "seeds": {
+        "group":   "Pipeline",
+        "label":   "Random seed(s)",
+        "type":    list,
+        "default": [0],
+    },
+    "num_images": {
+        "group":   "Dataset",
+        "label":   "Number of images",
+        "type":    int,
+        "default": 5000,
+        "min":     1,
+        "max":     5000,
+    },
+}
+
+MODEL_SPECIFIC_SCHEMA = {
+    "conf": {
+        "label":   "Confidence threshold",
+        "type":    float,
+        "default": 0.25,
+        "min":     0.01,
+        "max":     1.0,
+    },
+    "iou": {
+        "label":   "NMS IoU threshold",
+        "type":    float,
+        "default": 0.70,
+        "min":     0.01,
+        "max":     1.0,
+    },
+    "imgsz": {
+        "label":   "Image size override",
+        "type":    int,
+        "default": 640,
+        "min":     128,
+        "max":     1280,
+    },
+    "half": {
+        "label":   "FP16 half-precision",
+        "type":    bool,
+        "default": False,
+    },
+    "max_det": {
+        "label":   "Max detections per image",
+        "type":    int,
+        "default": 300,
+        "min":     1,
+        "max":     1000,
+    },
+    "batch_size": {
+        "label":   "Batch size override",
+        "type":    int,
+        "default": 32,
+        "min":     1,
+        "max":     128,
+    },
+    "epochs": {
+        "label":   "Epochs override",
+        "type":    int,
+        "default": 10,
+        "min":     1,
+        "max":     200,
+    },
+    "seeds": {
+        "label":   "Random seed(s) override",
+        "type":    list,
+        "default": [0],
+    },
 }
 
 
-def keys_in_group(group):
-    return [key for key, spec in SETTINGS.items() if spec["group"] == group]
-
-
 def format_value(spec, value):
+    """Format setting value for display."""
+    if spec["type"] is bool:
+        return "True" if value else "False"
+    if spec["type"] is list:
+        if isinstance(value, list):
+            if not value:
+                return "none"
+            if len(value) == 1:
+                return str(value[0])
+            if len(value) <= 3:
+                return f"{', '.join(str(v) for v in value)} ({len(value)} seeds)"
+            return f"{', '.join(str(v) for v in value[:3])} (+{len(value) - 3} more)"
+        return str(value)
     if spec["type"] is int:
         return f"{value:,}"
-    return f"{value:.10f}".rstrip("0").rstrip(".")
+    if spec["type"] is float:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    return str(value)
 
 
 def parse_value(spec, text):
     """Turn text into a valid value. Returns (value, error_message)."""
-    text = text.strip().replace("_", "")
+    if spec["type"] is list:
+        if isinstance(text, list):
+            vals = [int(x) for x in text if str(x).replace("_", "").isdigit() and int(str(x).replace("_", "")) >= 0]
+            return vals or [0], None
+        cleaned = str(text).strip().strip("[]").replace(",", " ").split()
+        vals = []
+        for c in cleaned:
+            c_clean = c.replace("_", "")
+            if c_clean.isdigit() and int(c_clean) >= 0:
+                vals.append(int(c_clean))
+            else:
+                return None, f"'{c}' is not a valid non-negative integer."
+        return vals or [0], None
+
+    text = str(text).strip()
+    if spec["type"] is bool:
+        lower = text.lower()
+        if lower in ("true", "t", "1", "yes", "y", "on"):
+            return True, None
+        if lower in ("false", "f", "0", "no", "n", "off"):
+            return False, None
+        return None, "Please enter true/false (or y/n)."
+
+    if spec["type"] is str:
+        if not text:
+            return None, "Value cannot be empty."
+        return text, None
+
+    clean = text.replace("_", "")
     if spec["type"] is int:
-        text = text.replace(",", "")
+        clean = clean.replace(",", "")
     try:
-        value = spec["type"](text)
+        value = spec["type"](clean)
     except ValueError:
         kind = "a whole number" if spec["type"] is int else "a number"
         return None, f"Please enter {kind}."
-    if not spec["min"] <= value <= spec["max"]:
+
+    if "min" in spec and "max" in spec and not (spec["min"] <= value <= spec["max"]):
         low  = format_value(spec, spec["min"])
         high = format_value(spec, spec["max"])
         return None, f"The value must be between {low} and {high}."
     return value, None
 
 
+# ---------------------------------------------------------------------------
+# Config Load and Save
+# ---------------------------------------------------------------------------
+
+def default_model_specific_dict():
+    """Build default settings dictionary for all available models."""
+    return {
+        m: {k: spec["default"] for k, spec in MODEL_SPECIFIC_SCHEMA.items()}
+        for m in get_available_models()
+    }
+
+
 def load_settings():
-    """Load numeric settings + selected_classes from config/config.json."""
-    values = {key: spec["default"] for key, spec in SETTINGS.items()}
-    values["selected_classes"] = []
+    """Load settings from config/config.json with shared vs model-specific split."""
+    shared = {k: spec["default"] for k, spec in SHARED_SETTINGS_SCHEMA.items()}
+    shared["selected_classes"] = []
+    selected_models = ["yolov8n.pt"]
+    model_specific = default_model_specific_dict()
+
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return values
-    if isinstance(saved, dict):
-        for key, spec in SETTINGS.items():
-            if key in saved:
-                value, error = parse_value(spec, str(saved[key]))
-                if error is None:
-                    values[key] = value
-        raw = saved.get("selected_classes", [])
-        if isinstance(raw, list):
-            values["selected_classes"] = [c for c in raw
-                                          if isinstance(c, str) and c in COCO_CLASSES]
-    return values
+        return {
+            "shared": shared,
+            "selected_models": selected_models,
+            "model_specific": model_specific,
+        }
+
+    if not isinstance(saved, dict):
+        return {
+            "shared": shared,
+            "selected_models": selected_models,
+            "model_specific": model_specific,
+        }
+
+    # 1. Load shared settings
+    shared_src = saved.get("shared", saved)  # fallback to top-level for legacy config
+    if isinstance(shared_src, dict):
+        for key, spec in SHARED_SETTINGS_SCHEMA.items():
+            if key in shared_src:
+                val, err = parse_value(spec, shared_src[key] if isinstance(shared_src[key], list) else str(shared_src[key]))
+                if err is None:
+                    shared[key] = val
+        # Sync seeds and seed
+        raw_seeds = shared_src.get("seeds")
+        if isinstance(raw_seeds, list) and raw_seeds:
+            s_parsed = [int(s) for s in raw_seeds if str(s).replace("_", "").isdigit() and int(str(s).replace("_", "")) >= 0]
+            if s_parsed:
+                shared["seeds"] = s_parsed
+                shared["seed"] = s_parsed[0]
+        elif "seed" in shared_src:
+            try:
+                s_val = int(shared_src["seed"])
+                if s_val >= 0:
+                    shared["seeds"] = [s_val]
+                    shared["seed"] = s_val
+            except (ValueError, TypeError):
+                pass
+        raw_classes = shared_src.get("selected_classes", saved.get("selected_classes", []))
+        if isinstance(raw_classes, list):
+            shared["selected_classes"] = [c for c in raw_classes if isinstance(c, str) and c in COCO_CLASSES]
+
+    # 2. Load selected models
+    raw_models = saved.get("selected_models")
+    if isinstance(raw_models, list) and raw_models:
+        valid = [m for m in raw_models if isinstance(m, str)]
+        if valid:
+            selected_models = valid
+
+    # 3. Load model-specific settings
+    spec_src = saved.get("model_specific", saved.get("model_settings", saved.get("models", {})))
+    if isinstance(spec_src, dict):
+        for m_name, m_cfg in spec_src.items():
+            if isinstance(m_cfg, dict):
+                if m_name not in model_specific:
+                    model_specific[m_name] = {k: s["default"] for k, s in MODEL_SPECIFIC_SCHEMA.items()}
+                for k, spec in MODEL_SPECIFIC_SCHEMA.items():
+                    if k in m_cfg:
+                        val, err = parse_value(spec, m_cfg[k] if isinstance(m_cfg[k], list) else str(m_cfg[k]))
+                        if err is None:
+                            model_specific[m_name][k] = val
+                # Sync model specific seeds
+                raw_m_seeds = m_cfg.get("seeds")
+                if isinstance(raw_m_seeds, list) and raw_m_seeds:
+                    m_parsed = [int(s) for s in raw_m_seeds if str(s).replace("_", "").isdigit() and int(str(s).replace("_", "")) >= 0]
+                    if m_parsed:
+                        model_specific[m_name]["seeds"] = m_parsed
+                        model_specific[m_name]["seed"] = m_parsed[0]
+                elif "seed" in m_cfg:
+                    try:
+                        v = int(m_cfg["seed"])
+                        if v >= 0:
+                            model_specific[m_name]["seeds"] = [v]
+                            model_specific[m_name]["seed"] = v
+                    except (ValueError, TypeError):
+                        pass
+
+    return {
+        "shared": shared,
+        "selected_models": selected_models,
+        "model_specific": model_specific,
+    }
 
 
-def save_settings(values):
+def save_settings(data):
     """Write settings dict to config/config.json. Returns True on success."""
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+        # Ensure seeds and seed stay in sync
+        shared_seeds = data["shared"].get("seeds", [0])
+        if not isinstance(shared_seeds, list) or not shared_seeds:
+            shared_seeds = [data["shared"].get("seed", 0)]
+        data["shared"]["seeds"] = shared_seeds
+        data["shared"]["seed"] = shared_seeds[0]
+
+        for m_cfg in data["model_specific"].values():
+            m_s = m_cfg.get("seeds", [0])
+            if not isinstance(m_s, list) or not m_s:
+                m_s = [m_cfg.get("seed", 0)]
+            m_cfg["seeds"] = m_s
+            m_cfg["seed"] = m_s[0]
+
+        # Construct clean, organized JSON structure
+        payload = {
+            "selected_models": data["selected_models"],
+            "shared": data["shared"],
+            "model_specific": data["model_specific"],
+        }
+        CONFIG_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     except OSError:
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# App state and navigation
+# App State and Navigation
 # ---------------------------------------------------------------------------
 
 class App:
@@ -232,8 +541,11 @@ class App:
 
     def __init__(self):
         loaded                = load_settings()
-        self.settings         = {k: loaded[k] for k in SETTINGS}
-        self.selected_classes = list(loaded["selected_classes"])
+        self.shared_settings  = loaded["shared"]
+        self.selected_models  = list(loaded["selected_models"])
+        self.model_settings   = loaded["model_specific"]
+        self.selected_classes = list(self.shared_settings.get("selected_classes", []))
+        self.editing_model    = None
         self.current          = "main"
         self.back_stack       = []
         self.forward_stack    = []
@@ -241,10 +553,14 @@ class App:
         self.running          = True
 
     def save(self):
-        """Persist numeric settings + selected_classes to config/config.json."""
-        full = dict(self.settings)
-        full["selected_classes"] = self.selected_classes
-        return save_settings(full)
+        """Persist settings to config/config.json."""
+        self.shared_settings["selected_classes"] = self.selected_classes
+        payload = {
+            "selected_models": self.selected_models,
+            "shared": self.shared_settings,
+            "model_specific": self.model_settings,
+        }
+        return save_settings(payload)
 
     def notify(self, kind, text):
         """Queue a message to show on the next render."""
@@ -256,6 +572,10 @@ class App:
         self.back_stack.append(self.current)
         self.forward_stack.clear()
         self.current = screen_id
+
+    def go_edit_model(self, model_name):
+        self.editing_model = model_name
+        self.go("configure_model_edit")
 
     def back(self):
         if not self.back_stack:
@@ -288,27 +608,155 @@ class Screen:
 
 
 # ---------------------------------------------------------------------------
-# Numeric settings editing
+# Shared Settings Editing
 # ---------------------------------------------------------------------------
 
-def setting_item(app, key, with_group=False):
-    spec = SETTINGS[key]
-    label = f"{spec['group']}: {spec['label']}" if with_group else f"Set {spec['label'].lower()}"
-    return Item(
-        label=label,
-        action=lambda a, k=key: edit_setting(a, k),
-        detail=format_value(spec, app.settings[key]),
-    )
+def prompt_multiple_seeds(current_seeds: list[int]) -> list[int] | None:
+    """Interactive CLI to prompt for number of seeds and specific seed values."""
+    print()
+    print(paint("Random Seeds Configuration", BOLD, CYAN))
+    current_str = ", ".join(str(s) for s in current_seeds) if current_seeds else "none"
+    print(f"Current seed(s): {paint(current_str, BOLD, GREEN)} ({len(current_seeds)} active)")
+    print()
+
+    while True:
+        raw_count = input(paint("Enter how many seeds you want (press Enter to cancel): ", BOLD, MAGENTA)).strip()
+        if not raw_count:
+            return None
+        if not raw_count.isdigit() or int(raw_count) < 1:
+            say("warning", "Please enter a whole number of at least 1 (e.g. 1, 2, 3).")
+            continue
+        count = int(raw_count)
+        break
+
+    print()
+    if count == 1:
+        print("Please enter the seed to use (whole number >= 0):")
+    else:
+        print(f"Please enter the {count} seeds that you want to use (e.g. 0, 42, 100):")
+        print(paint("Hint: You can enter them one by one, or all at once separated by commas/spaces.", DIM))
+    print()
+
+    seeds: list[int] = []
+    while len(seeds) < count:
+        remaining = count - len(seeds)
+        idx = len(seeds) + 1
+        prompt_txt = f"Seed {idx} of {count}"
+        if remaining > 1 and idx == 1:
+            prompt_txt += f" (or enter all {count} separated by commas/spaces)"
+        prompt_txt += " (press Enter to cancel): "
+
+        raw = input(paint(prompt_txt, BOLD, MAGENTA)).strip()
+        if not raw:
+            return None
+
+        # Check if user entered multiple values (comma or space separated)
+        parts = raw.replace(",", " ").split()
+        if len(parts) > 1:
+            batch_vals = []
+            parse_err = False
+            for p in parts:
+                clean = p.replace("_", "")
+                if not clean.isdigit() or int(clean) < 0:
+                    say("warning", f"'{p}' is not a valid non-negative integer. Please try again.")
+                    parse_err = True
+                    break
+                batch_vals.append(int(clean))
+            if parse_err:
+                continue
+
+            for v in batch_vals:
+                if len(seeds) < count:
+                    seeds.append(v)
+            if len(seeds) < count:
+                print(paint(f"Added {len(batch_vals)} seeds ({', '.join(str(s) for s in seeds)}). Still need {count - len(seeds)} more.", CYAN))
+            continue
+
+        clean = raw.replace("_", "")
+        if not clean.isdigit() or int(clean) < 0:
+            say("warning", f"'{raw}' is not a valid non-negative integer. Please enter a whole number >= 0.")
+            continue
+        seeds.append(int(clean))
+
+    return seeds
 
 
-def edit_setting(app, key):
-    spec    = SETTINGS[key]
-    low     = format_value(spec, spec["min"])
-    high    = format_value(spec, spec["max"])
-    current = format_value(spec, app.settings[key])
+def edit_shared_setting(app, key):
+    spec = SHARED_SETTINGS_SCHEMA[key]
+    current = app.shared_settings.get(key, spec["default"])
     print()
     print(paint(spec["label"], BOLD, CYAN))
-    print(f"Allowed range: {low} to {high}. Current value: {current}")
+
+    if key in ("seeds", "seed"):
+        current_seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+        new_seeds = prompt_multiple_seeds(current_seeds)
+        if new_seeds is None:
+            app.notify("info", "No changes made.")
+            return
+        app.shared_settings["seeds"] = new_seeds
+        app.shared_settings["seed"] = new_seeds[0]
+        seeds_str = ", ".join(str(s) for s in new_seeds)
+        if app.save():
+            app.notify("success", f"Random seed(s) set to: {seeds_str} ({len(new_seeds)} active).")
+        else:
+            app.notify("warning", "Random seed(s) set, but could not save.")
+        return
+
+    if key == "device":
+        cuda_ok, cuda_desc, gpu_name = get_cuda_status()
+        print(f"Current device: {paint(current, BOLD, GREEN)}")
+        if cuda_ok:
+            print(f"Hardware detected: {paint(gpu_name, BOLD, YELLOW)} ({cuda_desc})")
+        else:
+            print(paint(f"Hardware note: {cuda_desc}", YELLOW))
+        print()
+        print("Quick options:")
+        cuda_lbl = f"CUDA:0 ({gpu_name})" if cuda_ok else "CUDA:0 (Force CUDA)"
+        print(f"  {paint('1', BOLD, YELLOW)}. {cuda_lbl}")
+        print(f"  {paint('2', BOLD, YELLOW)}. cpu (Force CPU)")
+        print(f"  {paint('3', BOLD, YELLOW)}. Custom device string")
+        print()
+        raw = input(paint("Select option [1-3] or enter custom device (press Enter to cancel): ", BOLD, MAGENTA)).strip()
+        if not raw:
+            app.notify("info", "No changes made.")
+            return
+        if raw == "1":
+            new_val = "CUDA:0"
+        elif raw == "2":
+            new_val = "cpu"
+        elif raw == "3":
+            cust = input(paint("Enter device string (e.g. cuda:0, cuda:1, cpu): ", BOLD, MAGENTA)).strip()
+            if not cust:
+                app.notify("info", "No changes made.")
+                return
+            new_val = cust
+        else:
+            new_val = raw
+
+        # Verify device
+        try:
+            resolved = resolve_device(new_val)
+            app.shared_settings["device"] = new_val
+            app.save()
+            app.notify("success", f"Device set to '{new_val}' (verified: {resolved}).")
+        except Exception as exc:  # noqa: BLE001
+            app.notify("error", f"Device verification failed: {exc}")
+        return
+
+    if spec["type"] is bool:
+        app.shared_settings[key] = not current
+        app.save()
+        app.notify("success", f"{spec['label']} is now {app.shared_settings[key]}.")
+        return
+
+    low  = format_value(spec, spec.get("min", ""))
+    high = format_value(spec, spec.get("max", ""))
+    cur_fmt = format_value(spec, current)
+    if "min" in spec and "max" in spec:
+        print(f"Allowed range: {low} to {high}. Current value: {cur_fmt}")
+    else:
+        print(f"Current value: {cur_fmt}")
+
     while True:
         raw = input(paint("New value (press Enter to cancel): ", BOLD, MAGENTA))
         if not raw.strip():
@@ -318,13 +766,212 @@ def edit_setting(app, key):
         if error:
             say("warning", error)
             continue
-        app.settings[key] = value
+        app.shared_settings[key] = value
         text = f"{spec['label']} is now {format_value(spec, value)}."
         if app.save():
             app.notify("success", text)
         else:
             app.notify("warning", text + f" Could not save to {CONFIG_PATH.name}.")
         return
+
+
+def shared_setting_item(app, key, with_group=False):
+    spec = SHARED_SETTINGS_SCHEMA[key]
+    label = f"{spec['group']}: {spec['label']}" if with_group else f"Set {spec['label'].lower()}"
+    val = app.shared_settings[key]
+    detail = format_value(spec, val)
+    if key == "device" and str(val).upper().startswith("CUDA"):
+        cuda_ok, _, gpu_name = get_cuda_status()
+        if cuda_ok and gpu_name:
+            detail = f"{val} ({gpu_name})"
+    return Item(
+        label=label,
+        action=lambda a, k=key: edit_shared_setting(a, k),
+        detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model Selection Actions
+# ---------------------------------------------------------------------------
+
+def action_toggle_model(app, model_name: str):
+    """Toggle a model in selected_models."""
+    if model_name in app.selected_models:
+        if len(app.selected_models) == 1:
+            app.notify("warning", f"Cannot deselect '{model_name}'. At least one model must be active.")
+            return
+        app.selected_models.remove(model_name)
+    else:
+        app.selected_models.append(model_name)
+    app.save()
+
+
+def action_select_all_models(app):
+    models = get_available_models()
+    app.selected_models = list(models)
+    app.save()
+    app.notify("success", f"Selected all {len(models)} models.")
+
+
+def action_clear_model_selection(app):
+    # Keep at least the first available model
+    models = get_available_models()
+    default_m = models[0] if models else "yolov8n.pt"
+    app.selected_models = [default_m]
+    app.save()
+    app.notify("info", f"Reset selection to single model: {default_m}")
+
+
+def action_select_single_model(app, model_name: str):
+    app.selected_models = [model_name]
+    app.save()
+    app.notify("success", f"Active model set to '{model_name}' exclusively.")
+
+
+def model_selection_items(app):
+    models = get_available_models()
+    items = []
+    for m in models:
+        exists = (MODELS_DIR / m).exists()
+        tag = "✔" if m in app.selected_models else ""
+        if not exists:
+            tag += " [missing on disk]" if tag else "[missing]"
+        items.append(
+            Item(
+                label=m,
+                action=lambda a, name=m: action_toggle_model(a, name),
+                detail=tag,
+            )
+        )
+    items.append(Item("Select all models", action_select_all_models))
+    items.append(Item("Reset to single model (yolov8n.pt)", lambda a: action_select_single_model(a, "yolov8n.pt")))
+    return items
+
+
+def model_selection_body(app):
+    models = get_available_models()
+    n_sel = len(app.selected_models)
+    lines = [
+        "Pick a number to toggle  ✔ on/off. You can select one or multiple models.",
+    ]
+    if n_sel == 1:
+        lines.append(f"Active model: {paint(app.selected_models[0], BOLD, GREEN)} (single-model mode)")
+    else:
+        shown = ", ".join(app.selected_models)
+        lines.append(f"Active models ({n_sel}/{len(models)}): {paint(shown, BOLD, GREEN)} (multi-model mode)")
+
+    dev = app.shared_settings.get("device", "CUDA:0")
+    cuda_ok, cuda_desc, gpu_name = get_cuda_status()
+    if str(dev).upper().startswith("CUDA") and cuda_ok:
+        lines.append(f"Target compute device: {paint(dev, BOLD, CYAN)} [{paint(gpu_name, BOLD, YELLOW)}]")
+    else:
+        lines.append(f"Target compute device: {paint(dev, BOLD, CYAN)} ({cuda_desc})")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Model-Specific Settings Editing
+# ---------------------------------------------------------------------------
+
+def edit_model_setting(app, model_name: str, key: str):
+    spec = MODEL_SPECIFIC_SCHEMA[key]
+    cfg = app.model_settings.setdefault(model_name, {})
+    current = cfg.get(key, spec["default"])
+    print()
+    print(paint(f"{model_name} → {spec['label']}", BOLD, CYAN))
+
+    if key in ("seeds", "seed"):
+        current_seeds = cfg.get("seeds", [cfg.get("seed", 0)])
+        new_seeds = prompt_multiple_seeds(current_seeds)
+        if new_seeds is None:
+            app.notify("info", "No changes made.")
+            return
+        cfg["seeds"] = new_seeds
+        cfg["seed"] = new_seeds[0]
+        seeds_str = ", ".join(str(s) for s in new_seeds)
+        if app.save():
+            app.notify("success", f"[{model_name}] Random seed(s) set to: {seeds_str} ({len(new_seeds)} active).")
+        else:
+            app.notify("warning", f"[{model_name}] Random seed(s) set, but could not save.")
+        return
+
+    if spec["type"] is bool:
+        cfg[key] = not current
+        app.save()
+        app.notify("success", f"[{model_name}] {spec['label']} toggled to {cfg[key]}.")
+        return
+
+    low  = format_value(spec, spec["min"])
+    high = format_value(spec, spec["max"])
+    cur_fmt = format_value(spec, current)
+    print(f"Allowed range: {low} to {high}. Current value: {cur_fmt}")
+
+    while True:
+        raw = input(paint("New value (press Enter to cancel): ", BOLD, MAGENTA))
+        if not raw.strip():
+            app.notify("info", "No changes made.")
+            return
+        value, error = parse_value(spec, raw)
+        if error:
+            say("warning", error)
+            continue
+        cfg[key] = value
+        app.save()
+        app.notify("success", f"[{model_name}] {spec['label']} set to {format_value(spec, value)}.")
+        return
+
+
+def action_reset_model_settings(app, model_name: str):
+    app.model_settings[model_name] = {k: spec["default"] for k, spec in MODEL_SPECIFIC_SCHEMA.items()}
+    app.save()
+    app.notify("success", f"Reset {model_name} settings to defaults.")
+
+
+def model_edit_items(app):
+    m = app.editing_model or "yolov8n.pt"
+    cfg = app.model_settings.setdefault(m, {})
+    items = []
+    for key, spec in MODEL_SPECIFIC_SCHEMA.items():
+        val = cfg.get(key, spec["default"])
+        items.append(
+            Item(
+                label=f"Set {spec['label'].lower()}",
+                action=lambda a, name=m, k=key: edit_model_setting(a, name, k),
+                detail=format_value(spec, val),
+            )
+        )
+    items.append(Item("Reset this model's settings to default", lambda a, name=m: action_reset_model_settings(a, name)))
+    return items
+
+
+def model_edit_body(app):
+    m = app.editing_model or "yolov8n.pt"
+    status = "Active (Selected)" if m in app.selected_models else "Inactive (Not selected)"
+    color = GREEN if m in app.selected_models else GRAY
+    return [
+        f"Configuring parameters for: {paint(m, BOLD, CYAN)} [{paint(status, BOLD, color)}]",
+        "Changes are saved to 'model_specific' inside config/config.json.",
+    ]
+
+
+def model_list_menu_items(app):
+    items = []
+    for m in get_available_models():
+        cfg = app.model_settings.setdefault(m, {})
+        conf = cfg.get("conf", 0.25)
+        iou = cfg.get("iou", 0.70)
+        imgsz = cfg.get("imgsz", 640)
+        half = cfg.get("half", False)
+        detail_str = f"conf={conf:.2f}, iou={iou:.2f}, sz={imgsz}, fp16={'Y' if half else 'N'}"
+        items.append(
+            Item(
+                label=f"{m} settings",
+                action=lambda a, name=m: a.go_edit_model(name),
+                detail=detail_str,
+            )
+        )
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -374,20 +1021,21 @@ def class_body(app):
     if len(app.selected_classes) > 6:
         shown += f" +{len(app.selected_classes) - 6} more"
     n   = len(app.selected_classes)
-    per = app.settings["num_images"] // n
+    per = app.shared_settings["num_images"] // n
     return [
         "Pick a number to toggle  ✔ on/off. Press 'b' when done.",
         f"Selected ({n}): {paint(shown, BOLD, GREEN)}",
-        f"~{per:,} images per class  ({app.settings['num_images']:,} total)",
+        f"~{per:,} images per class  ({app.shared_settings['num_images']:,} total)",
     ]
 
 
 # ---------------------------------------------------------------------------
-# Actions
+# Dataset Actions
 # ---------------------------------------------------------------------------
 
 def _load_downloader():
-    import importlib.util, pathlib
+    import importlib.util
+    import pathlib
     spec = importlib.util.spec_from_file_location(
         "download_dataset",
         pathlib.Path(__file__).resolve().parent / "download_dataset.py",
@@ -398,21 +1046,22 @@ def _load_downloader():
 
 
 def action_start_download(app):
-    count   = app.settings["num_images"]
+    count   = app.shared_settings["num_images"]
     classes = app.selected_classes or None
+    workers = app.shared_settings.get("workers", 8)
     print()
 
     if classes:
         n   = len(classes)
         per = count // n
-        say("info", f"Downloading ~{per:,} images × {n} class(es) "
+        say("info", f"Downloading ~{per:,} images × {n} class(es) with {workers} workers "
                     f"→ {', '.join('dataset/' + c for c in classes)}")
     else:
-        say("info", f"Downloading {count:,} images → dataset/ (no class filter)")
+        say("info", f"Downloading {count:,} images with {workers} workers → dataset/ (no class filter)")
 
     try:
         mod     = _load_downloader()
-        summary = mod.download_dataset(count, classes=classes)
+        summary = mod.download_dataset(count, classes=classes, workers=workers)
         d, s, f = summary["downloaded"], summary["skipped"], len(summary["failed"])
         msg = f"Done — {d:,} downloaded, {s:,} skipped"
         if f:
@@ -434,16 +1083,16 @@ def _count_all_images():
 
 
 def action_clear_dataset(app):
-    """Delete images from a chosen class folder (or everything)."""
+    """Delete images and annotations from a chosen class folder (or everything)."""
     if not DATASET_DIR.exists():
         app.notify("info", "The dataset folder does not exist.")
         return
 
     subdirs = [d for d in sorted(DATASET_DIR.iterdir())
-               if d.is_dir() and any(d.rglob("*.jpg"))]
+               if d.is_dir() and (any(d.rglob("*.jpg")) or (d / "annotations.json").exists())]
     all_images = list(DATASET_DIR.rglob("*.jpg"))
 
-    if not all_images:
+    if not all_images and not subdirs:
         app.notify("info", "The dataset folder is already empty.")
         return
 
@@ -467,32 +1116,31 @@ def action_clear_dataset(app):
 
     target = choices[int(raw) - 1]
     images = list(target.rglob("*.jpg")) if target else all_images
-    desc   = f"all images in dataset/{target.name}/" if target else "all dataset images"
+    desc   = f"all files in dataset/{target.name}/" if target else "all dataset files and subfolders"
 
-    if not confirm(f"Delete {len(images):,} file(s) — {desc}? This cannot be undone."):
+    if not confirm(f"Delete {desc}? This cannot be undone."):
         app.notify("info", "Cancelled. Nothing was deleted.")
         return
 
-    removed = 0
-    for f in images:
+    import shutil
+    removed_count = len(images)
+    if target:
         try:
-            f.unlink()
-            removed += 1
-        except OSError:
-            pass
+            shutil.rmtree(target)
+        except OSError as exc:
+            app.notify("error", f"Could not remove folder dataset/{target.name}: {exc}")
+            return
+    else:
+        for item in DATASET_DIR.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            except OSError:
+                pass
 
-    # Remove empty subdirectories
-    roots = [target] if target else [DATASET_DIR]
-    for root in roots:
-        for d in sorted(root.rglob("*"), reverse=True):
-            if d.is_dir():
-                try:
-                    d.rmdir()
-                except OSError:
-                    pass
-
-    msg = f"{removed:,} image(s) deleted."
-
+    msg = f"{removed_count:,} image(s) and folder data cleared."
     if ANNOTATIONS_CACHE.exists() and confirm(
             "Also delete the cached annotations (instances_val2017.json)?"):
         try:
@@ -504,49 +1152,399 @@ def action_clear_dataset(app):
     app.notify("success", msg)
 
 
+# ---------------------------------------------------------------------------
+# Results & Benchmarks Actions
+# ---------------------------------------------------------------------------
+
+def get_results_dir() -> Path:
+    """Return the base results directory, creating it if needed."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    return RESULTS_DIR
+
+
+def get_run_timestamp() -> str:
+    """Format start time for folder names: YYYY-MM-DD_HH-MM-SS."""
+    return datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def set_seed(seed: int = 0):
+    """Set random seed across Python random, NumPy, and PyTorch for reproducible runs."""
+    import random
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+
+def _list_result_runs():
+    """Return sorted list of run directories in results/ and runs/."""
+    runs = []
+    if RESULTS_DIR.exists():
+        for d in sorted(RESULTS_DIR.iterdir()):
+            if d.is_dir():
+                runs.append(d)
+    if RUNS_DIR.exists():
+        for d in sorted(RUNS_DIR.iterdir()):
+            if d.is_dir() and d not in runs:
+                runs.append(d)
+    return runs
+
+
 def action_clear_results(app):
-    if not confirm("Delete all results? This cannot be undone."):
+    """Delete previous run results from results/ or runs/."""
+    run_dirs = _list_result_runs()
+    if not run_dirs:
+        app.notify("info", "The results folder is already empty.")
+        return
+
+    print()
+    print(paint("Which results do you want to clear?", BOLD, CYAN))
+    print()
+    choices = run_dirs + [None]   # None = clear everything
+    for i, d in enumerate(choices, start=1):
+        if d is None:
+            lbl = f"All result folders ({len(run_dirs)} runs total)"
+        else:
+            try:
+                rel = d.relative_to(PROJECT_ROOT)
+            except ValueError:
+                rel = d
+            lbl = f"{rel}/"
+        print(f"  {paint(i, BOLD, YELLOW)}. {lbl}")
+    print()
+
+    raw = input(paint("> ", BOLD, MAGENTA)).strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(choices)):
+        app.notify("info", "Cancelled.")
+        return
+
+    target = choices[int(raw) - 1]
+    targets = [target] if target else run_dirs
+    desc = f"{target.name}/" if target else f"all {len(run_dirs)} run(s)"
+
+    if not confirm(f"Delete {desc}? This cannot be undone."):
         app.notify("info", "Cancelled. Nothing was deleted.")
         return
-    # TODO: delete your results files here.
-    app.notify("warning", "Clearing results is not connected yet. Nothing was deleted.")
+
+    import shutil
+    removed = 0
+    for d in targets:
+        try:
+            shutil.rmtree(d)
+            removed += 1
+        except OSError:
+            pass
+    app.notify("success", f"Deleted {removed} result folder(s).")
 
 
 def action_test_latency(app):
-    # TODO: run your latency test here.
-    app.notify("warning", "The latency test is not connected yet.")
+    """Run real inference benchmark on selected models and save to results/[timeofstarting]/."""
+    target_models = app.selected_models or [get_available_models()[0]]
+    raw_device = app.shared_settings.get("device", "CUDA:0")
+    seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+    set_seed(seeds[0])
+    start_time = datetime.now().astimezone()
+    timestamp_str = start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = get_results_dir() / timestamp_str
+
+    print()
+    say("info", f"Initializing latency benchmark for {len(target_models)} model(s)...")
+    if len(seeds) > 1:
+        say("info", f"Seed(s) active: {paint(', '.join(str(s) for s in seeds), BOLD, GREEN)} ({len(seeds)} seeds)")
+    else:
+        say("info", f"Seed active: {paint(str(seeds[0]), BOLD, GREEN)}")
+
+    # Resolve device and verify CUDA usage
+    try:
+        resolved_device = resolve_device(raw_device)
+    except Exception as exc:  # noqa: BLE001
+        app.notify("error", f"Device resolution failed: {exc}")
+        return
+
+    cuda_active = resolved_device.startswith("cuda")
+    device_desc = resolved_device
+    if cuda_active:
+        import torch
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        device_desc = f"{raw_device} → {resolved_device} [{gpu_name}]"
+        say("info", f"Compute target: {paint(device_desc, BOLD, GREEN)}")
+        say("info", f"PyTorch CUDA active: {torch.version.cuda} | Device {torch.cuda.current_device()}")
+    else:
+        say("info", f"Compute target: {paint(resolved_device, BOLD, YELLOW)} (CPU)")
+
+    say("info", f"Output directory: {paint(f'results/{timestamp_str}/', BOLD, CYAN)}")
+
+    try:
+        import numpy as np
+        from ultralytics import YOLO
+    except ImportError as exc:
+        app.notify("error", f"Missing dependency: {exc}. Please ensure 'ultralytics' and 'numpy' are installed.")
+        return
+
+    results = []
+    for model_name in target_models:
+        model_path = MODELS_DIR / model_name
+        if not model_path.exists():
+            say("warning", f"Model file '{model_name}' not found in {MODELS_DIR}. Skipping.")
+            continue
+
+        say("info", f"Benchmarking {paint(model_name, BOLD, CYAN)}...")
+        m_cfg = app.model_settings.get(model_name, {})
+        img_size = m_cfg.get("imgsz", app.shared_settings.get("imgsz", 640))
+        half_precision = m_cfg.get("half", False) and cuda_active
+        conf = m_cfg.get("conf", 0.25)
+        iou = m_cfg.get("iou", 0.70)
+
+        try:
+            model = YOLO(str(model_path))
+            model.to(resolved_device)
+
+            # Explicit check to verify model parameters are on CUDA
+            if cuda_active:
+                is_on_cuda = next(model.model.parameters()).is_cuda
+                if not is_on_cuda:
+                    raise RuntimeError(f"Failed to place {model_name} onto CUDA.")
+
+            dummy_input = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+            predict_kwargs = {
+                "device": resolved_device,
+                "conf": conf,
+                "iou": iou,
+                "verbose": False,
+            }
+            if half_precision:
+                predict_kwargs["half"] = True
+
+            # Warmup passes
+            for _ in range(5):
+                _ = model.predict(dummy_input, **predict_kwargs)
+
+            if cuda_active:
+                import torch
+                torch.cuda.synchronize()
+
+            # Timed iterations
+            iterations = 20
+            latencies = []
+            for _ in range(iterations):
+                t0 = time.perf_counter()
+                _ = model.predict(dummy_input, **predict_kwargs)
+                if cuda_active:
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                latencies.append((t1 - t0) * 1000.0)
+
+            avg_ms = sum(latencies) / len(latencies)
+            min_ms = min(latencies)
+            max_ms = max(latencies)
+            fps = 1000.0 / avg_ms if avg_ms > 0 else 0
+
+            results.append({
+                "model": model_name,
+                "avg_ms": avg_ms,
+                "min_ms": min_ms,
+                "max_ms": max_ms,
+                "fps": fps,
+                "precision": "FP16" if half_precision else "FP32",
+                "imgsz": img_size,
+            })
+        except Exception as exc:  # noqa: BLE001
+            say("error", f"Error benchmarking {model_name}: {exc}")
+
+    if not results:
+        app.notify("warning", "No models were successfully benchmarked.")
+        return
+
+    # Create timestamped result directory
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save machine-readable JSON
+    benchmark_payload = {
+        "timestamp_start": start_time.isoformat(),
+        "folder": timestamp_str,
+        "device_config": raw_device,
+        "resolved_device": resolved_device,
+        "device_description": device_desc,
+        "seeds": seeds,
+        "seed": seeds[0],
+        "iterations": 20,
+        "warmup_passes": 5,
+        "results": results,
+    }
+    (run_dir / "latency_benchmark.json").write_text(
+        json.dumps(benchmark_payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+    # Save human-readable summary
+    summary_lines = [
+        "═" * 76,
+        f" LATENCY BENCHMARK RESULTS ({device_desc})",
+        f" Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "═" * 76,
+        f" {'Model':<16} {'Size':<6} {'Precision':<10} {'Latency (avg)':<16} {'Min/Max':<16} {'FPS':<8}",
+        "-" * 76,
+    ]
+    for r in results:
+        m_str = f" {r['model']:<15} "
+        sz_str = f"{r['imgsz']:<6} "
+        pr_str = f"{r['precision']:<10} "
+        lat_str = f"{r['avg_ms']:.2f} ms".ljust(16)
+        mm_str = f"{r['min_ms']:.1f}/{r['max_ms']:.1f}ms".ljust(16)
+        fps_str = f"{r['fps']:.1f}".ljust(8)
+        summary_lines.append(m_str + sz_str + pr_str + lat_str + mm_str + fps_str)
+    summary_lines.append("═" * 76)
+    (run_dir / "latency_benchmark.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    # Print formatted benchmark summary table
+    print()
+    print(paint("═" * 76, BOLD, CYAN))
+    print(paint(f" LATENCY BENCHMARK RESULTS ({device_desc})", BOLD, WHITE))
+    print(paint("═" * 76, BOLD, CYAN))
+    print(f" {'Model':<16} {'Size':<6} {'Precision':<10} {'Latency (avg)':<16} {'Min/Max':<16} {'FPS':<8}")
+    print("-" * 76)
+    for r in results:
+        m_str = f" {r['model']:<15} "
+        sz_str = f"{r['imgsz']:<6} "
+        pr_str = f"{r['precision']:<10} "
+        lat_str = f"{r['avg_ms']:.2f} ms".ljust(16)
+        mm_str = f"{r['min_ms']:.1f}/{r['max_ms']:.1f}ms".ljust(16)
+        fps_str = f"{r['fps']:.1f}".ljust(8)
+        print(paint(m_str, BOLD, YELLOW) + sz_str + pr_str + paint(lat_str, BOLD, GREEN) + mm_str + fps_str)
+    print(paint("═" * 76, BOLD, CYAN))
+    print()
+    say("success", f"Results saved to: {paint(f'results/{timestamp_str}/', BOLD, GREEN)}")
+    say("info", f"  • {run_dir / 'latency_benchmark.json'}")
+    say("info", f"  • {run_dir / 'latency_benchmark.txt'}")
+    print()
+
+    input(paint("Press Enter to return to menu... ", BOLD, MAGENTA))
+    app.notify("success", f"Latency benchmark completed — saved to results/{timestamp_str}/")
 
 
 def action_run_training(app):
-    # TODO: start your training here (read app.settings for the values).
-    app.notify("warning", "Training is not connected yet.")
+    """Check dataset, device and trigger training pipeline, saving to results/[timeofstarting]/."""
+    target_models = app.selected_models or [get_available_models()[0]]
+    raw_device = app.shared_settings.get("device", "CUDA:0")
+    seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+    set_seed(seeds[0])
+    start_time = datetime.now().astimezone()
+    timestamp_str = start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = get_results_dir() / timestamp_str
+
+    print()
+    say("info", "Checking training environment and parameters...")
+    if len(seeds) > 1:
+        say("info", f"Seed(s) active: {paint(', '.join(str(s) for s in seeds), BOLD, GREEN)} ({len(seeds)} seeds)")
+    else:
+        say("info", f"Seed active: {paint(str(seeds[0]), BOLD, GREEN)}")
+
+    try:
+        resolved_device = resolve_device(raw_device)
+    except Exception as exc:  # noqa: BLE001
+        app.notify("error", f"Device resolution failed: {exc}")
+        return
+
+    cuda_active = resolved_device.startswith("cuda")
+    if cuda_active:
+        import torch
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        say("info", f"Using GPU device: {paint(gpu_name, BOLD, GREEN)} (device={resolved_device})")
+    else:
+        say("warning", f"Using CPU compute: {resolved_device}")
+
+    # Check dataset
+    n_images = _count_all_images()
+    say("info", f"Dataset images available: {n_images:,}")
+    if n_images == 0:
+        app.notify("warning", "No images found in dataset/. Please run 'Download dataset' first.")
+        return
+
+    print()
+    print(paint("Selected models for training / fine-tuning:", BOLD, CYAN))
+    for m in target_models:
+        m_cfg = app.model_settings.get(m, {})
+        ep = m_cfg.get("epochs", app.shared_settings["epochs"])
+        bs = m_cfg.get("batch_size", app.shared_settings["batch_size"])
+        sz = m_cfg.get("imgsz", app.shared_settings["imgsz"])
+        print(f"  • {paint(m, BOLD, YELLOW)}: epochs={ep}, batch_size={bs}, imgsz={sz}")
+    print()
+
+    say("info", f"Output directory will be: {paint(f'results/{timestamp_str}/', BOLD, CYAN)}")
+    print()
+
+    if not confirm(f"Start training session on {len(target_models)} model(s) with {resolved_device}?"):
+        app.notify("info", "Training cancelled.")
+        return
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    training_meta = {
+        "timestamp_start": start_time.isoformat(),
+        "folder": timestamp_str,
+        "device": raw_device,
+        "resolved_device": resolved_device,
+        "seeds": seeds,
+        "seed": seeds[0],
+        "shared_settings": app.shared_settings,
+        "selected_models": target_models,
+        "model_specific": {m: app.model_settings.get(m, {}) for m in target_models},
+        "dataset_images": n_images,
+    }
+    (run_dir / "training_config.json").write_text(
+        json.dumps(training_meta, indent=2) + "\n", encoding="utf-8"
+    )
+
+    say("info", "Training pipeline initialized. Configuration saved.")
+    say("success", f"Outputs mapped to: {paint(f'results/{timestamp_str}/', BOLD, GREEN)}")
+    app.notify("success", f"Training configured — outputs saving to results/{timestamp_str}/")
 
 
 # ---------------------------------------------------------------------------
-# Screens
+# Screens Definition
 # ---------------------------------------------------------------------------
-
-def value_of(app, key):
-    return format_value(SETTINGS[key], app.settings[key])
-
 
 def main_items(app):
     total = _count_all_images()
+    n_models = len(app.selected_models)
+    dev = app.shared_settings.get("device", "CUDA:0")
+    cuda_ok, _, gpu_name = get_cuda_status()
+    dev_str = f"{dev} ({gpu_name})" if (str(dev).upper().startswith("CUDA") and cuda_ok and gpu_name) else str(dev)
+    n_runs = len(_list_result_runs())
+
+    if n_models == 1:
+        model_detail = app.selected_models[0]
+    else:
+        model_detail = f"{n_models} selected"
+
     return [
-        Item("Download dataset",   lambda a: a.go("download_dataset")),
-        Item("Clear dataset",      lambda a: a.go("clear_dataset"),
+        Item("Download dataset",            lambda a: a.go("download_dataset")),
+        Item("Clear dataset",               lambda a: a.go("clear_dataset"),
              detail=f"{total:,} images" if total else "empty"),
-        Item("Configure training", lambda a: a.go("configure_training")),
-        Item("Clear results",      lambda a: a.go("clear_results")),
-        Item("Test latency",       lambda a: a.go("test_latency")),
-        Item("Run training",       lambda a: a.go("run_training")),
-        Item("All settings",       lambda a: a.go("all_settings")),
+        Item("Select model(s)",             lambda a: a.go("select_models"),
+             detail=model_detail),
+        Item("Configure shared settings",   lambda a: a.go("configure_shared"),
+             detail=dev_str),
+        Item("Configure model settings",    lambda a: a.go("model_settings_menu")),
+        Item("Test latency (benchmark)",    lambda a: a.go("test_latency"),
+             detail=f"on {dev}"),
+        Item("Run training",                lambda a: a.go("run_training")),
+        Item("Clear results",               lambda a: a.go("clear_results"),
+             detail=f"{n_runs} run(s)" if n_runs else "empty"),
+        Item("All settings",                lambda a: a.go("all_settings")),
     ]
 
 
 def download_body(app):
     n   = len(app.selected_classes)
-    total = app.settings["num_images"]
+    total = app.shared_settings["num_images"]
     lines = []
     if n:
         per   = total // n
@@ -561,7 +1559,7 @@ def download_body(app):
     else:
         lines += [
             "Classes:  none — images will be downloaded by id into dataset/",
-            f"Images:   {paint(value_of(app, 'num_images'), BOLD, GREEN)}",
+            f"Images:   {paint(format_value(SHARED_SETTINGS_SCHEMA['num_images'], total), BOLD, GREEN)}",
         ]
     return lines
 
@@ -571,23 +1569,51 @@ def download_items(app):
     return [
         Item("Choose classes",   lambda a: a.go("select_classes"),
              detail=f"{n} selected" if n else "none (all images)"),
-        setting_item(app, "num_images"),
+        shared_setting_item(app, "num_images"),
         Item("Start download",   action_start_download),
     ]
 
 
 def run_training_body(app):
-    lines = ["Training will use these settings:"]
-    for key, spec in SETTINGS.items():
-        lines.append(f"  {spec['label']}: {paint(value_of(app, key), BOLD, GREEN)}")
+    seeds = app.shared_settings.get("seeds", [app.shared_settings.get("seed", 0)])
+    seeds_fmt = ", ".join(str(s) for s in seeds)
+    if len(seeds) > 1:
+        seeds_fmt += f" ({len(seeds)} seeds)"
+
+    lines = [
+        "Training pipeline configuration:",
+        f"  Compute device: {paint(app.shared_settings['device'], BOLD, GREEN)}",
+        f"  Active model(s): {paint(', '.join(app.selected_models), BOLD, CYAN)}",
+        f"  Random seed(s): {paint(seeds_fmt, BOLD, GREEN)}",
+        f"  Epochs:         {paint(app.shared_settings['epochs'], BOLD, GREEN)}",
+        f"  Batch size:     {paint(app.shared_settings['batch_size'], BOLD, GREEN)}",
+        f"  Learning rate:  {paint(app.shared_settings['learning_rate'], BOLD, GREEN)}",
+    ]
     return lines
+
+
+def all_settings_items(app):
+    items = []
+    # Shared settings
+    for key in SHARED_SETTINGS_SCHEMA:
+        items.append(shared_setting_item(app, key, with_group=True))
+    # Link to model specific settings
+    for m in get_available_models():
+        items.append(
+            Item(
+                label=f"Model: {m} settings",
+                action=lambda a, name=m: a.go_edit_model(name),
+                detail="configure",
+            )
+        )
+    return items
 
 
 SCREENS = {
     "main": Screen(
         title="Main menu",
         color=MAGENTA,
-        body=lambda app: ["Choose what you want to do."],
+        body=lambda app: ["Choose an action or configure dataset & model parameters."],
         items=main_items,
     ),
     "download_dataset": Screen(
@@ -609,33 +1635,64 @@ SCREENS = {
         ],
         items=lambda app: [Item("Clear dataset now", action_clear_dataset)],
     ),
-    "configure_training": Screen(
-        title="Configure training",
-        body=lambda app: ["Settings used when you run training."],
-        items=lambda app: [setting_item(app, key) for key in keys_in_group("Training")],
+    "select_models": Screen(
+        title="Select YOLO models",
+        body=model_selection_body,
+        items=model_selection_items,
+    ),
+    "configure_shared": Screen(
+        title="Configure shared settings",
+        body=lambda app: [
+            "Shared parameters applied to all models and operations.",
+            "Device setting 'CUDA:0' automatically utilizes CUDA GPU.",
+        ],
+        items=lambda app: [shared_setting_item(app, key) for key in SHARED_SETTINGS_SCHEMA],
+    ),
+    "model_settings_menu": Screen(
+        title="Model-specific settings",
+        body=lambda app: [
+            "Choose a model below to configure its individual parameters",
+            "(confidence threshold, IoU threshold, FP16 half-precision, etc.).",
+        ],
+        items=model_list_menu_items,
+    ),
+    "configure_model_edit": Screen(
+        title="Model configuration",
+        body=model_edit_body,
+        items=model_edit_items,
     ),
     "clear_results": Screen(
         title="Clear results",
-        body=lambda app: ["Removes the results of previous runs."],
+        body=lambda app: ["Removes saved runs and benchmark outputs."],
         items=lambda app: [Item("Clear results now", action_clear_results)],
     ),
     "test_latency": Screen(
         title="Test latency",
-        body=lambda app: ["Measures how fast the model responds."],
-        items=lambda app: [Item("Run latency test", action_test_latency)],
+        body=lambda app: [
+            f"Active models ({len(app.selected_models)}): {', '.join(app.selected_models)}",
+            f"Target device: {app.shared_settings.get('device', 'CUDA:0')}",
+            "Measures warmup and inference response time (ms & FPS) on GPU/CPU.",
+        ],
+        items=lambda app: [
+            Item("Run latency test now", action_test_latency),
+            Item("Select models to test", lambda a: a.go("select_models")),
+            Item("Configure device / shared", lambda a: a.go("configure_shared")),
+        ],
     ),
     "run_training": Screen(
         title="Run training",
         body=run_training_body,
         items=lambda app: [
-            Item("Start training",           action_run_training),
-            Item("Change training settings", lambda a: a.go("configure_training")),
+            Item("Start training session",   action_run_training),
+            Item("Select models",            lambda a: a.go("select_models")),
+            Item("Change shared settings",   lambda a: a.go("configure_shared")),
+            Item("Configure model settings", lambda a: a.go("model_settings_menu")),
         ],
     ),
     "all_settings": Screen(
         title="All settings",
-        body=lambda app: ["Every setting in one place. Choose one to change it."],
-        items=lambda app: [setting_item(app, key, with_group=True) for key in SETTINGS],
+        body=lambda app: ["Every setting in one place. Choose one to modify it."],
+        items=all_settings_items,
     ),
 }
 
@@ -679,7 +1736,7 @@ def render(app):
             print(line)
         print()
 
-    width = max(len(item.label) for item in items)
+    width = max((len(item.label) for item in items), default=20)
     for number, item in enumerate(items, start=1):
         detail = paint(item.detail, BOLD, GREEN) if item.detail else ""
         print(f"  {paint(number, BOLD, YELLOW)}. {item.label.ljust(width)}   {detail}".rstrip())

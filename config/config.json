@@ -1,6 +1,90 @@
 {
-  "num_images": 20,
-  "epochs": 10,
-  "batch_size": 32,
-  "learning_rate": 0.001
+  "selected_models": [
+    "yolo26n.pt",
+    "yolo11n.pt",
+    "yolov8n.pt",
+    "yolov10n.pt",
+    "yolo12n.pt"
+  ],
+  "shared": {
+    "device": "CUDA:0",
+    "epochs": 100,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "imgsz": 640,
+    "workers": 16,
+    "seeds": [
+      0
+    ],
+    "num_images": 5000,
+    "selected_classes": [],
+    "seed": 0
+  },
+  "model_specific": {
+    "yolo26n.pt": {
+      "conf": 0.25,
+      "iou": 0.7,
+      "imgsz": 640,
+      "half": false,
+      "max_det": 300,
+      "batch_size": 32,
+      "epochs": 10,
+      "seeds": [
+        0
+      ],
+      "seed": 0
+    },
+    "yolo11n.pt": {
+      "conf": 0.25,
+      "iou": 0.7,
+      "imgsz": 640,
+      "half": false,
+      "max_det": 300,
+      "batch_size": 32,
+      "epochs": 10,
+      "seeds": [
+        0
+      ],
+      "seed": 0
+    },
+    "yolov8n.pt": {
+      "conf": 0.25,
+      "iou": 0.7,
+      "imgsz": 640,
+      "half": false,
+      "max_det": 300,
+      "batch_size": 32,
+      "epochs": 10,
+      "seeds": [
+        0
+      ],
+      "seed": 0
+    },
+    "yolov10n.pt": {
+      "conf": 0.25,
+      "iou": 0.7,
+      "imgsz": 640,
+      "half": false,
+      "max_det": 300,
+      "batch_size": 32,
+      "epochs": 10,
+      "seeds": [
+        0
+      ],
+      "seed": 0
+    },
+    "yolo12n.pt": {
+      "conf": 0.25,
+      "iou": 0.7,
+      "imgsz": 640,
+      "half": false,
+      "max_det": 300,
+      "batch_size": 32,
+      "epochs": 10,
+      "seeds": [
+        0
+      ],
+      "seed": 0
+    }
+  }
 }

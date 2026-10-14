@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Download COCO images into per-class subfolders inside dataset/.
 
 Usage (from the project root):
@@ -352,7 +352,25 @@ def download_dataset(count, classes=None, workers=DEFAULT_WORKERS):
         say("info", f"Downloading {len(images):,} images to {out_dir}")
         summary = _run_pool([(img, out_dir) for img in images], workers)
         report(summary, out_dir)
+        ann_path = out_dir / "annotations.json"
+        ann_path.write_text(
+            json.dumps(_plain_annotations(data, images), indent=2),
+            encoding="utf-8",
+        )
+        say("info", f"Annotations saved to {ann_path}")
         return summary
+
+
+def _plain_annotations(data, images):
+    """Return a COCO-format dict filtered to `images` for unpartitioned downloads."""
+    image_ids = {img["id"] for img in images}
+    return {
+        "info":        data.get("info", {}),
+        "licenses":    data.get("licenses", []),
+        "images":      [img for img in data["images"] if img["id"] in image_ids],
+        "annotations": [a   for a   in data["annotations"] if a["image_id"] in image_ids],
+        "categories":  data.get("categories", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +380,49 @@ def download_dataset(count, classes=None, workers=DEFAULT_WORKERS):
 def default_count():
     """The num_images value saved by run_terminal.py, or DEFAULT_COUNT."""
     try:
-        value = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("num_images")
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "shared" in data and isinstance(data["shared"], dict) and "num_images" in data["shared"]:
+                value = data["shared"]["num_images"]
+            else:
+                value = data.get("num_images")
+        else:
+            value = None
     except (OSError, ValueError, AttributeError):
         return DEFAULT_COUNT
     return value if isinstance(value, int) and value > 0 else DEFAULT_COUNT
+
+
+def default_classes():
+    """The selected_classes list saved by run_terminal.py, or None."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "shared" in data and isinstance(data["shared"], dict) and "selected_classes" in data["shared"]:
+                classes = data["shared"]["selected_classes"]
+            else:
+                classes = data.get("selected_classes")
+            if isinstance(classes, list) and classes:
+                return classes
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def default_workers():
+    """The workers value saved in config/config.json, or DEFAULT_WORKERS."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "shared" in data and isinstance(data["shared"], dict) and "workers" in data["shared"]:
+                value = data["shared"]["workers"]
+            else:
+                value = data.get("workers")
+            if isinstance(value, int) and value > 0:
+                return value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return DEFAULT_WORKERS
 
 
 def positive_int(text):
@@ -382,8 +439,8 @@ def main(argv=None):
                         help="total images (split equally across classes if --classes is set)")
     parser.add_argument("--classes", nargs="+", metavar="CLASS",
                         help="COCO class names; each saved to dataset/<class>/")
-    parser.add_argument("--workers", type=positive_int, default=DEFAULT_WORKERS,
-                        help=f"parallel downloads (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--workers", type=positive_int, default=None,
+                        help=f"parallel downloads (default from config or {DEFAULT_WORKERS})")
     parser.add_argument("--list-classes", action="store_true",
                         help="print all 80 COCO class names and exit")
     args = parser.parse_args(argv)
@@ -394,8 +451,10 @@ def main(argv=None):
         return 0
 
     count = args.num_images or default_count()
+    chosen_classes = args.classes if args.classes is not None else default_classes()
+    chosen_workers = args.workers if args.workers is not None else default_workers()
     try:
-        summary = download_dataset(count, classes=args.classes, workers=args.workers)
+        summary = download_dataset(count, classes=chosen_classes, workers=chosen_workers)
     except KeyboardInterrupt:
         print()
         say("warning", "Stopped. Run the script again to continue where it stopped.")
