@@ -1,296 +1,410 @@
-#!/usr/bin/env python3
-"""download_dataset.py: Download the Phase 1 recognition test set (500 COCO images).
+﻿#!/usr/bin/env python3
+"""Download COCO images into per-class subfolders inside dataset/.
 
-Phase 1 is a general recognition test, not a deployment for one specific use
-case, so the set has NO per-class quota and is not limited to a few classes:
+Usage (from the project root):
+    python src/download_dataset.py                         # 1 000 images, no class filter
+    python src/download_dataset.py -n 300                 # 300 images into dataset/
+    python src/download_dataset.py -n 300 --classes dog person cat
+                                                          # 100/class: dataset/dog/
+                                                          #             dataset/person/
+                                                          #             dataset/cat/
+    python src/download_dataset.py --list-classes         # print all 80 COCO class names
 
-- Images come from the whole COCO 2017 label set (80 classes), not only
-  person / vehicle images.
-- Exactly --final-samples images are kept (default 500).
-- Selection is a seeded random draw from a larger candidate pool, so the class
-  mix follows what COCO photos really contain (some classes, such as person,
-  will be common and others rare).
-- One light safeguard keeps the set varied: every class that exists in the
-  candidate pool must appear in at least --min-images-per-class images
-  (default 1). This is a floor, not a quota. Use 0 to turn it off.
-- Images with no labelled object are skipped, because they have no baseline.
+When --classes is used, each class folder receives a filtered annotations.json.
+Images come from COCO 2017 val (5 000 images total). Re-running skips files
+already on disk and only fetches what is missing.
 
-Writes the images plus manifest.csv, manifest.json (file name, classes, object
-count, width and height in pixels, detections) and class_summary.csv (how many
-images and objects each class got) into the export folder.
-
-Requires: fiftyone, numpy, pandas, Pillow
+Only the Python standard library is needed.
 """
 
-from __future__ import annotations
-
 import argparse
+import http.client
+import io
 import json
 import os
-import random
-import shutil
 import sys
-from collections import Counter
-from typing import Any
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-import pandas as pd
-from PIL import Image
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
+PROJECT_ROOT      = Path(__file__).resolve().parent.parent
+CONFIG_PATH       = PROJECT_ROOT / "config" / "config.json"  # written by run_terminal.py
+DEFAULT_OUT_DIR   = PROJECT_ROOT / "dataset"
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Download a varied 500-image COCO test set for Digital Filography (Phase 1)."
-    )
-    parser.add_argument(
-        "--export-dir",
-        type=str,
-        default="dataset",
-        help="Export folder for images (default: dataset)",
-    )
-    parser.add_argument(
-        "--pool-size",
-        type=int,
-        default=3000,
-        help="Candidate pool size loaded from the FiftyOne Zoo (default: 3000)",
-    )
-    parser.add_argument(
-        "--final-samples",
-        type=int,
-        default=500,
-        help="Total number of images in the test set (default: 500)",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="validation",
-        help="COCO split: validation or train (default: validation)",
-    )
-    parser.add_argument(
-        "--min-images-per-class",
-        type=int,
-        default=1,
-        help="Every class found in the pool appears in at least this many images; 0 disables (default: 1)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for repeatable sampling (default: 42)",
-    )
-    return parser.parse_args()
+ANNOTATIONS_URL   = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+ANNOTATION_FILE   = "instances_val2017.json"
+ANNOTATIONS_CACHE = PROJECT_ROOT / "config" / ANNOTATION_FILE  # cached after first fetch
 
+MAX_IMAGES      = 5_000  # images available in COCO val2017
+DEFAULT_COUNT   = 1_000  # fallback when neither -n nor config/config.json is present
+DEFAULT_WORKERS = 8      # parallel downloads
+TIMEOUT         = 30     # seconds per request
+RETRIES         = 3      # attempts before giving up
 
-def select_images(
-    pool: list[dict[str, Any]],
-    target_count: int,
-    seed: int = 42,
-    min_per_class: int = 1,
-) -> list[dict[str, Any]]:
-    """Pick exactly target_count records at random, then make sure no class is missing.
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
 
-    Each record needs a "classes" list. There is no per-class quota. The only rule
-    is the floor: every class in the pool gets at least min_per_class images (or
-    all of its images if the pool has fewer). Missing classes are fixed by
-    swapping one image of an already well-covered set for one that has the class.
-    """
-    if target_count <= 0:
-        raise ValueError("target_count must be positive")
-    if len(pool) < target_count:
-        raise ValueError(f"Pool has {len(pool)} usable images but {target_count} were requested; raise --pool-size.")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
-    rng = random.Random(seed)
-    order = list(range(len(pool)))
-    rng.shuffle(order)
+if os.name == "nt":
+    os.system("")  # enable ANSI on Windows
 
-    chosen: set[int] = set(order[:target_count])
-    in_pool: Counter[str] = Counter(c for rec in pool for c in rec["classes"])
-    counts: Counter[str] = Counter(c for i in chosen for c in pool[i]["classes"])
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
-    def floor_for(cls: str) -> int:
-        return min(min_per_class, in_pool[cls])
+RESET, BOLD = "\033[0m", "\033[1m"
+RED, GREEN, YELLOW, CYAN, GRAY = "\033[31m", "\033[32m", "\033[33m", "\033[36m", "\033[90m"
 
-    if min_per_class > 0:
-        for cls in sorted(in_pool, key=lambda c: (in_pool[c], c)):      # rarest classes first
-            while counts[cls] < floor_for(cls):
-                new = next((i for i in order if i not in chosen and cls in pool[i]["classes"]), None)
-                victims = [
-                    i for i in chosen
-                    if cls not in pool[i]["classes"]
-                    and all(counts[c] - 1 >= floor_for(c) for c in pool[i]["classes"])
-                ]
-                if new is None or not victims:
-                    print(f"  Warning: could not raise class '{cls}' to {floor_for(cls)} image(s).")
-                    break
-                # Drop the image whose classes are the most over-represented.
-                victim = max(victims, key=lambda i: (sum(counts[c] for c in pool[i]["classes"]), -order.index(i)))
-                chosen.remove(victim)
-                counts.subtract(pool[victim]["classes"])
-                chosen.add(new)
-                counts.update(pool[new]["classes"])
-
-    assert len(chosen) == target_count
-    return sorted((pool[i] for i in chosen), key=lambda rec: rec["filename"])
+MESSAGE_STYLES = {
+    "success": ("✔", GREEN),
+    "info":    ("ℹ", CYAN),
+    "warning": ("⚠", YELLOW),
+    "error":   ("✖", RED),
+}
 
 
-def main() -> int:
-    args = parse_args()
+def paint(text, *styles):
+    if not USE_COLOR or not styles:
+        return str(text)
+    return "".join(styles) + str(text) + RESET
 
-    print("Initializing FiftyOne...")
-    import fiftyone.zoo as foz
 
-    os.makedirs(args.export_dir, exist_ok=True)
+def say(kind, text):
+    symbol, color = MESSAGE_STYLES[kind]
+    print(paint(f"{symbol} ", BOLD, color) + text)
 
-    print("================================================================================")
-    print("COCO 2017 Phase 1 Recognition Test Set Downloader")
-    print(f"Export directory:     {args.export_dir}")
-    print(f"Split:                {args.split}")
-    print(f"Candidate pool:       {args.pool_size}")
-    print(f"Final samples:        {args.final_samples}")
-    print(f"Min images per class: {args.min_images_per_class}")
-    print(f"Random seed:          {args.seed}")
-    print("================================================================================")
 
-    # 1. Load candidate pool from the FiftyOne Zoo (all 80 COCO classes)
-    print(f"\n[1/4] Ensuring candidate pool of {args.pool_size} samples in FiftyOne Zoo...")
-    pool_dataset = foz.load_zoo_dataset(
-        "coco-2017",
-        split=args.split,
-        label_types=["detections"],
-        max_samples=args.pool_size,
-        shuffle=True,
-        seed=args.seed,
-    )
-    print(f"Candidate pool ready with {len(pool_dataset)} samples.")
+def show_progress(done, total, width=30):
+    filled  = int(width * done / total) if total else width
+    bar     = paint("█" * filled, GREEN) + paint("░" * (width - filled), GRAY)
+    percent = int(100 * done / total) if total else 100
+    sys.stdout.write(f"\r{bar} {done:,}/{total:,} ({percent}%)")
+    sys.stdout.flush()
 
-    # 2. Extract metadata and class lists
-    print("\n[2/4] Parsing candidate annotations...")
-    pool_records: list[dict[str, Any]] = []
-    skipped_unreadable = 0
-    skipped_empty = 0
-    for sample in pool_dataset:
-        filepath = sample.filepath
-        filename = os.path.basename(filepath)
-        # Skip images corrupted by interrupted downloads
+
+# ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
+
+def fetch(request):
+    """Open a request and return (status, headers, body). Retries on network errors."""
+    last_error = None
+    for attempt in range(RETRIES):
         try:
-            with Image.open(filepath) as _img:
-                _img.load()
-        except Exception:
-            print(f"  Skipping unreadable image: {filename}")
-            skipped_unreadable += 1
-            continue
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            if 400 <= error.code < 500:
+                raise                      # a missing file will not appear on retry
+            last_error = error
+        except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError) as error:
+            last_error = error
+        time.sleep(1.5 * (attempt + 1))
+    raise last_error
 
-        detections = []
-        counts: Counter[str] = Counter()
-        gt = getattr(sample, "ground_truth", None)
-        if gt is not None:
-            for det in gt.detections:
-                lbl = det.label.lower().strip()
-                counts[lbl] += 1
-                detections.append({
-                    "label": lbl,
-                    "bbox_norm": [round(float(x), 4) for x in det.bounding_box],
-                    "confidence": float(getattr(det, "confidence", 1.0) or 1.0),
-                })
 
-        if not detections:
-            skipped_empty += 1      # nothing labelled, so nothing to recognise
-            continue
+class RemoteFile(io.RawIOBase):
+    """A read-only file fetched from a URL piece by piece.
 
-        pool_records.append({
-            "filepath": filepath,
-            "filename": filename,
-            "classes": sorted(counts),
-            "class_counts": dict(counts),
-            "num_objects": len(detections),
-            "detections": detections,
-        })
+    Lets us open the big COCO annotations zip and read only the one JSON file
+    we need, without downloading the whole archive.
+    """
 
-    print(f"Usable images: {len(pool_records)} (skipped {skipped_unreadable} unreadable, {skipped_empty} with no labels)")
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.pos = 0
+        status, headers, _ = fetch(self._request(0, 0))
+        if status != 206:
+            raise RuntimeError("The server does not support partial downloads.")
+        self.size = int(headers["Content-Range"].split("/")[-1])
 
-    # 3. Select the test set
-    print(f"\n[3/4] Selecting {args.final_samples} images...")
-    selected = select_images(
-        pool_records,
-        target_count=args.final_samples,
-        seed=args.seed,
-        min_per_class=args.min_images_per_class,
-    )
-    print(f"Selected {len(selected)} images.")
+    def _request(self, start, end):
+        return urllib.request.Request(self.url, headers={"Range": f"bytes={start}-{end}"})
 
-    # 4. Clean export directory & copy selected images
-    print("\n[4/4] Exporting images and writing the manifest...")
-    for fname in os.listdir(args.export_dir):
-        if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-            os.remove(os.path.join(args.export_dir, fname))
+    def readable(self):  return True
+    def seekable(self):  return True
+    def tell(self):      return self.pos
 
-    manifest_records = []
-    csv_rows = []
-    img_per_class: Counter[str] = Counter()
-    obj_per_class: Counter[str] = Counter()
+    def seek(self, offset, whence=io.SEEK_SET):
+        if   whence == io.SEEK_SET: target = offset
+        elif whence == io.SEEK_CUR: target = self.pos + offset
+        else:                       target = self.size + offset
+        self.pos = max(0, target)
+        return self.pos
 
-    for item in selected:
-        dst_path = os.path.join(args.export_dir, item["filename"])
-        shutil.copy2(item["filepath"], dst_path)
+    def readinto(self, buffer):
+        wanted = min(len(buffer), self.size - self.pos)
+        if wanted <= 0:
+            return 0
+        status, _, data = fetch(self._request(self.pos, self.pos + wanted - 1))
+        if status != 206:
+            raise RuntimeError("The server does not support partial downloads.")
+        buffer[:len(data)] = data
+        self.pos += len(data)
+        return len(data)
 
-        with Image.open(dst_path) as img:
-            w_px, h_px = img.size
 
-        img_per_class.update(item["classes"])
-        obj_per_class.update(item["class_counts"])
+# ---------------------------------------------------------------------------
+# Annotations
+# ---------------------------------------------------------------------------
 
-        manifest_records.append({
-            "filename": item["filename"],
-            "width": w_px,
-            "height": h_px,
-            "classes": item["classes"],
-            "num_objects": item["num_objects"],
-            "detections": item["detections"],
-        })
-        csv_rows.append({
-            "filename": item["filename"],
-            "classes": ", ".join(item["classes"]),
-            "num_objects": item["num_objects"],
-            "width": w_px,
-            "height": h_px,
-        })
+def load_annotations():
+    """Load COCO val2017 annotations from local cache or remote archive.
 
-    manifest_json_path = os.path.join(args.export_dir, "manifest.json")
-    with open(manifest_json_path, "w", encoding="utf-8") as f:
-        json.dump(manifest_records, f, indent=2)
-    print(f"Saved manifest JSON:  {manifest_json_path}")
+    On the first call the annotation file is fetched from the COCO archive and
+    saved to config/instances_val2017.json. Every subsequent call reads that
+    local cache, skipping the remote download entirely.
+    """
+    if ANNOTATIONS_CACHE.exists():
+        say("info", f"Reading annotations from cache ({ANNOTATIONS_CACHE.name})...")
+        return json.loads(ANNOTATIONS_CACHE.read_text(encoding="utf-8"))
+    say("info", "Fetching COCO annotations (one-time download, will be cached)...")
+    remote = RemoteFile(ANNOTATIONS_URL)
+    reader = io.BufferedReader(remote, buffer_size=1 << 20)
+    with zipfile.ZipFile(reader) as archive:
+        name = next((n for n in archive.namelist() if n.endswith(ANNOTATION_FILE)), None)
+        if name is None:
+            raise RuntimeError(f"{ANNOTATION_FILE} was not found in the COCO archive.")
+        with archive.open(name) as handle:
+            data = json.load(handle)
+    ANNOTATIONS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    ANNOTATIONS_CACHE.write_text(json.dumps(data), encoding="utf-8")
+    say("success", f"Annotations cached to {ANNOTATIONS_CACHE}")
+    return data
 
-    manifest_csv_path = os.path.join(args.export_dir, "manifest.csv")
-    pd.DataFrame(csv_rows).to_csv(manifest_csv_path, index=False, encoding="utf-8")
-    print(f"Saved manifest CSV:   {manifest_csv_path}")
 
-    summary_rows = [
-        {"class": cls, "images": img_per_class[cls], "objects": obj_per_class[cls]}
-        for cls in sorted(img_per_class, key=lambda c: (-img_per_class[c], c))
-    ]
-    summary_path = os.path.join(args.export_dir, "class_summary.csv")
-    pd.DataFrame(summary_rows).to_csv(summary_path, index=False, encoding="utf-8")
-    print(f"Saved class summary:  {summary_path}")
+def list_categories():
+    """Return a sorted list of all 80 COCO category names."""
+    return sorted(cat["name"] for cat in load_annotations()["categories"])
 
-    # Distribution report (what the random draw produced, not a quota check)
-    widths = [r["width"] for r in manifest_records]
-    heights = [r["height"] for r in manifest_records]
-    objs = [r["num_objects"] for r in manifest_records]
-    print("\n" + "=" * 80)
-    print(f"Total images: {len(selected)} | Classes covered: {len(img_per_class)} | Folder: {args.export_dir}")
-    print(f"Objects per image: min {min(objs)}, mean {sum(objs) / len(objs):.1f}, max {max(objs)}")
-    print(f"Resolution: width {min(widths)}-{max(widths)} px, height {min(heights)}-{max(heights)} px")
-    print("-" * 80)
-    print(f"{'Class':<22}{'Images':>8}{'Objects':>9}    {'Class':<22}{'Images':>8}{'Objects':>9}")
-    half = (len(summary_rows) + 1) // 2
-    for i in range(half):
-        left = summary_rows[i]
-        line = f"{left['class']:<22}{left['images']:>8}{left['objects']:>9}"
-        if i + half < len(summary_rows):
-            right = summary_rows[i + half]
-            line += f"    {right['class']:<22}{right['images']:>8}{right['objects']:>9}"
-        print(line)
-    print("=" * 80)
-    return 0
+
+def _images_for_class(data, class_name, limit):
+    """Return up to `limit` images containing `class_name`, sorted by image id."""
+    name_to_id = {c["name"]: c["id"] for c in data["categories"]}
+    cat_id = name_to_id.get(class_name)
+    if cat_id is None:
+        raise ValueError(
+            f"'{class_name}' is not a COCO category. "
+            "Run with --list-classes to see valid names."
+        )
+    img_ids    = {a["image_id"] for a in data["annotations"] if a["category_id"] == cat_id}
+    img_lookup = {img["id"]: img for img in data["images"]}
+    return sorted(
+        (img_lookup[i] for i in img_ids if i in img_lookup),
+        key=lambda x: x["id"],
+    )[:limit]
+
+
+def _class_annotations(data, images, class_name):
+    """Return a COCO-format dict filtered to `images` and `class_name` only."""
+    image_ids = {img["id"] for img in images}
+    cat_id    = next(c["id"] for c in data["categories"] if c["name"] == class_name)
+    return {
+        "info":        data.get("info", {}),
+        "licenses":    data.get("licenses", []),
+        "images":      [img for img in data["images"] if img["id"] in image_ids],
+        "annotations": [a   for a   in data["annotations"]
+                        if a["image_id"] in image_ids and a["category_id"] == cat_id],
+        "categories":  [c   for c   in data["categories"] if c["id"] == cat_id],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Downloading
+# ---------------------------------------------------------------------------
+
+def download_one(image, out_dir):
+    """Download one image. Returns ('downloaded'|'skipped'|'failed', error)."""
+    path = out_dir / Path(image["file_name"]).name
+    if path.exists() and path.stat().st_size > 0:
+        return "skipped", None
+    try:
+        _, _, body = fetch(urllib.request.Request(image["coco_url"]))
+        if not body.startswith(b"\xff\xd8"):
+            raise ValueError("the file is not a JPEG image")
+        temp = path.with_suffix(".part")
+        temp.write_bytes(body)
+        temp.replace(path)   # only finished files get the final name
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        return "failed", str(error)
+    return "downloaded", None
+
+
+def _run_pool(image_dir_pairs, workers):
+    """Download (image_info, out_dir) pairs in parallel. Returns summary dict."""
+    total   = len(image_dir_pairs)
+    summary = {"downloaded": 0, "skipped": 0, "failed": []}
+    pool    = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {pool.submit(download_one, img, d): img for img, d in image_dir_pairs}
+        show_progress(0, total)
+        for done, future in enumerate(as_completed(futures), start=1):
+            status, error = future.result()
+            if status == "failed":
+                summary["failed"].append((futures[future]["file_name"], error))
+            else:
+                summary[status] += 1
+            show_progress(done, total)
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown()
+    print()
+    return summary
+
+
+def report(summary, out_dir):
+    say("success", f"Downloaded {summary['downloaded']:,} new images to {out_dir}")
+    if summary["skipped"]:
+        say("info", f"{summary['skipped']:,} images were already there and were skipped")
+    failed = summary["failed"]
+    if failed:
+        say("error", f"{len(failed):,} images failed. Run the script again to retry them.")
+        for name, error in failed[:5]:
+            print(paint(f"    {name}: {error}", GRAY))
+        if len(failed) > 5:
+            print(paint(f"    ...and {len(failed) - 5:,} more", GRAY))
+
+
+def download_dataset(count, classes=None, workers=DEFAULT_WORKERS):
+    """Download COCO val2017 images, optionally split into per-class subfolders.
+
+    Parameters
+    ----------
+    count   : total images to download. When `classes` is given the count is
+              divided equally: e.g. 300 images with 3 classes -> 100 per class.
+    classes : list of COCO class names. Each class is saved in its own folder
+                  dataset/<class>/
+              with a matching annotations.json inside it.
+              Pass None (or []) to download by image id into dataset/ directly.
+    workers : parallel download threads.
+
+    Returns
+    -------
+    dict  {"downloaded": int, "skipped": int, "failed": [(name, error), ...]}
+
+    Disk layout with classes=["dog", "person"]
+    -------------------------------------------
+    dataset/
+      dog/
+        000001.jpg
+        000002.jpg
+        annotations.json    <- COCO-format, filtered to dog images only
+      person/
+        000003.jpg
+        annotations.json    <- COCO-format, filtered to person images only
+    """
+    if count > MAX_IMAGES:
+        say("warning", f"Capping at {MAX_IMAGES:,} (COCO val2017 limit).")
+        count = MAX_IMAGES
+
+    data = load_annotations()
+
+    if classes:
+        # ── per-class download ─────────────────────────────────────────────
+        per_class = max(1, count // len(classes))
+        combined  = {"downloaded": 0, "skipped": 0, "failed": []}
+
+        for class_name in classes:
+            say("info", f"[{class_name}] selecting up to {per_class:,} images...")
+            try:
+                images = _images_for_class(data, class_name, per_class)
+            except ValueError as exc:
+                say("error", str(exc))
+                continue
+
+            out_dir = DEFAULT_OUT_DIR / class_name
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            summary = _run_pool([(img, out_dir) for img in images], workers)
+            report(summary, out_dir)
+
+            # Filtered annotations.json inside the class folder
+            ann_path = out_dir / "annotations.json"
+            ann_path.write_text(
+                json.dumps(_class_annotations(data, images, class_name), indent=2),
+                encoding="utf-8",
+            )
+            say("info", f"Annotations saved to {ann_path}")
+
+            for key in ("downloaded", "skipped"):
+                combined[key] += summary[key]
+            combined["failed"].extend(summary["failed"])
+
+        return combined
+
+    else:
+        # ── plain download (no class filter) ──────────────────────────────
+        images  = sorted(data["images"], key=lambda x: x["id"])[:count]
+        out_dir = DEFAULT_OUT_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        say("info", f"Downloading {len(images):,} images to {out_dir}")
+        summary = _run_pool([(img, out_dir) for img in images], workers)
+        report(summary, out_dir)
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+def default_count():
+    """The num_images value saved by run_terminal.py, or DEFAULT_COUNT."""
+    try:
+        value = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("num_images")
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_COUNT
+    return value if isinstance(value, int) and value > 0 else DEFAULT_COUNT
+
+
+def positive_int(text):
+    value = int(text.replace(",", "").replace("_", ""))
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Download COCO val2017 images into per-class subfolders inside dataset/.")
+    parser.add_argument("-n", "--num-images", type=positive_int,
+                        help="total images (split equally across classes if --classes is set)")
+    parser.add_argument("--classes", nargs="+", metavar="CLASS",
+                        help="COCO class names; each saved to dataset/<class>/")
+    parser.add_argument("--workers", type=positive_int, default=DEFAULT_WORKERS,
+                        help=f"parallel downloads (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--list-classes", action="store_true",
+                        help="print all 80 COCO class names and exit")
+    args = parser.parse_args(argv)
+
+    if args.list_classes:
+        for name in list_categories():
+            print(name)
+        return 0
+
+    count = args.num_images or default_count()
+    try:
+        summary = download_dataset(count, classes=args.classes, workers=args.workers)
+    except KeyboardInterrupt:
+        print()
+        say("warning", "Stopped. Run the script again to continue where it stopped.")
+        return 130
+    except (RuntimeError, OSError, zipfile.BadZipFile, KeyError, ValueError) as error:
+        print()
+        say("error", f"The download stopped: {error}")
+        return 1
+    return 1 if summary["failed"] else 0
 
 
 if __name__ == "__main__":
