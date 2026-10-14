@@ -8,9 +8,9 @@
   ],
   "shared": {
     "device": "CUDA:0",
-    "conf": 0.5,
+    "conf": 0.25,
     "iou": 0.7,
-    "half": false,
+    "half": true,
     "max_det": 300,
     "plots": true,
     "save_json": false,
@@ -19,15 +19,15 @@
     "split": "val",
     "epochs": 100,
     "batch_size": 32,
-    "learning_rate": 0.001,
+    "learning_rate": 0.01,
     "imgsz": 640,
-    "workers": 16,
+    "workers": 8,
     "seeds": [
-      0
+      1
     ],
     "num_images": 5000,
     "selected_classes": [],
-    "seed": 0
+    "seed": 1
   },
   "metrics": {
     "speed_breakdown": true,

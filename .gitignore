@@ -4,3 +4,5 @@ dataset/
 results/
 runs/
 config/instances_val2017.json
+*.cache
+src/generate_report.py

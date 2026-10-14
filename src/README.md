@@ -1,28 +1,49 @@
 # Source Files
 
+The source package is organized into three modular layers:
+1. **[`config_manager.py`](config_manager.py)**: Central configuration, hardware/CUDA resolution, random seed management, settings schema, and App state.
+2. **[`eval_engine.py`](eval_engine.py)**: Computational pipeline engine for dataset prep, latency benchmarks, multi-seed validation loops with Mean ± Standard Deviation statistics, and training runs.
+3. **[`run_terminal.py`](run_terminal.py)**: Menu-driven terminal UI, keyboard navigation, and CLI runner.
+
+---
+
 ## `run_terminal.py`
 Interactive menu-driven terminal for configuring and launching dataset downloads,
 YOLO model selection, and CUDA hardware benchmarking; run it from the project root with `python src/run_terminal.py`.
+
+It can also be invoked directly with flags:
+- `python src/run_terminal.py --run-tests`: Run multi-seed validation on all active models non-interactively.
+- `python src/run_terminal.py --clear-results`: Clear previous run outputs without menu prompts.
 
 ### Screens
 | Screen | Purpose |
 |---|---|
 | Download dataset | Pick COCO classes, set image count, start download |
-| Resize dataset (640x640) | Central-crop and resize dataset to 640x640 via bilinear interpolation with bounded annotations |
 | Clear dataset | Delete images from a specific class folder (`dataset/<class>/`) or all folders |
 | Select model(s) | Choose one or multiple YOLO models (`yolo26n.pt`, `yolo11n.pt`, `yolov8n.pt`, `yolov10n.pt`, `yolo12n.pt`) |
 | Configure shared settings | Manage global pipeline and model settings: compute device (`CUDA:0`), confidence threshold (`conf`), NMS threshold (`iou`), FP16 half-precision (`half`), max detections (`max_det`), evaluation plots (`plots`), COCO JSON export (`save_json`), class-agnostic NMS (`agnostic_nms`), test-time augmentation (`augment`), dataset split (`split`), random seed(s), epochs, batch size, learning rate, image size, workers |
 | Configure tracked metrics | Toggle metrics tracking (speed breakdown, model complexity, GPU VRAM, accuracy) and benchmark iterations |
 | Test latency (benchmark) | Run real-time inference latency benchmark (avg ms, FPS, min/max, VRAM, speed breakdown) on CUDA GPU or CPU |
-| Run tests (evaluation) | Evaluate object detection performance (mAP50, mAP50-95, P, R, F1, speed, plots) directly on dataset without fine-tuning |
+| Run tests (evaluation) | Evaluate object detection performance across all specified seeds calculating Mean ± Standard Deviation (mAP50, mAP50-95, P, R, F1, speed) directly on dataset |
 | Run training | Review active models, shared settings, and initiate training pipeline |
 | Clear results | Remove previous run artefacts (`runs/`, `results/`) |
 | All settings | View and edit all shared pipeline and metric settings from a single place |
 
+---
+
+## `eval_engine.py`
+Core computational workflows:
+- **Multi-Seed Testing**: Iterates through each configured seed, executes `model.val()`, and computes sample Mean ± Standard Deviation for mAP50, mAP50-95, precision, recall, F1-score, and latency.
+- **Latency Benchmarking**: Measures warmup and timed passes on CUDA GPU or CPU with speed breakdown and VRAM tracking.
+- **Dataset Preparation**: Generates YOLO annotation `.txt` files directly from COCO annotations and creates runtime `test_data.yaml`.
 
 ---
 
-## Models Catalogue (`models/`)
+## `config_manager.py`
+- Stores configuration schemas (`SHARED_SETTINGS_SCHEMA`, `METRICS_SCHEMA`).
+- Validates and coerces user inputs with `parse_value` and formats display with `format_value`.
+- Enforces CUDA GPU detection and device string normalization (`resolve_device`).
+- Manages `App` state and persistence to `config/config.json`.
 Pretrained weights located in `models/`:
 - `yolo26n.pt`
 - `yolo11n.pt`
@@ -115,40 +136,6 @@ dataset/
 
 ---
 
-## `resize_dataset.py`
-Crops and resizes dataset images to an exact $640 \times 640$ square using bilinear interpolation, with bounding boxes and polygon segmentations updated and clipped to match.
-
-### Crop & Resample Mechanics
-- **Central Crop**: For any image of dimensions $(W, H)$, an aspect-preserving square of side length $S = \min(W, H)$ is extracted from the center at coordinates:
-  $$\text{crop\_x} = \frac{W - S}{2}, \quad \text{crop\_y} = \frac{H - S}{2}$$
-- **Zero Distortion**: No black bars (letterboxing/padding), no stretching or non-uniform scaling.
-- **Resampling**: The cropped square is resized to $640 \times 640$ using PIL Bilinear interpolation (`Image.Resampling.BILINEAR`).
-- **Annotation Bounding**:
-  - Bounding boxes $[x, y, w, h]$ are translated by $-(\text{crop\_x}, \text{crop\_y})$, scaled by $\frac{640}{S}$, and clamped to $[0, 640]$.
-  - Width and height are recalculated; boxes that fall completely outside the crop or end up with dimensions $< 1\text{px}$ are discarded.
-  - Segmentation polygons are transformed, scaled, clamped to $[0, 640]$, and updated.
-  - Image metadata records in `annotations.json` are updated with `width: 640, height: 640`.
-- **Atomic Writes**: Images are written to a `.part` temporary file and renamed atomically to prevent corrupted files if interrupted.
-
-### CLI Usage
-```bash
-# Resize images in dataset/ to 640x640 using 16 worker threads
-python src/resize_dataset.py
-
-# Custom target size or custom thread pool
-python src/resize_dataset.py --size 640 --workers 8
-
-# Target an explicit dataset folder
-python src/resize_dataset.py --dataset-dir dataset/
-```
-
-### Terminal Integration
-Can be triggered directly from the interactive terminal (`python src/run_terminal.py`):
-- From the **Main Menu**: choose `Resize dataset (640x640)`
-- From the **Download dataset** screen: choose `Resize dataset (640x640)`
-
----
-
 ## Results Directory (`results/<timeofstarting>/`)
 Whenever you execute a benchmark, test evaluation, or training run, results are automatically organized into:
 ```
@@ -160,10 +147,46 @@ results/
     test_summary.txt          ← Formatted evaluation comparison table
     test_data.yaml            ← Generated dataset YAML configuration for testing
     val_images.txt            ← Manifest of dataset images evaluated
-    <model_name>/             ← Evaluation plots (confusion matrices, PR curves, batch predictions)
-    training_config.json      ← Full configuration snapshot for training runs
-    train/                    ← Model checkpoints, curves, and confusion matrices
-```
 Previous runs can be selectively viewed and deleted through the **Clear results** menu in `run_terminal.py`.
+
+---
+
+## `generate_report.py` (Research Reporting & Synthesis)
+Compiles benchmark and evaluation outputs into comprehensive, publication-grade research reports.
+
+**Key capabilities**:
+- **Data Aggregation**: Ingests `test_results.json`, calculating sample Mean ± Standard Deviation ($s = \sqrt{\frac{1}{N-1}\sum (x_i - \bar{x})^2}$) across seeds.
+- **Diagnostic Asset Archival**: Automatically extracts and copies key model visual figures (Normalized Confusion Matrices, Precision-Recall curves, F1-confidence curves, sample prediction batches) into `reports/assets/<run_id>/` so reports remain fully intact after clearing raw run scratch.
+- **Pareto & Efficiency Analysis**: Evaluates parameter efficiency (mAP50 / MParams), latency breakdowns (preprocess, forward, postprocess), and throughput.
+- **Hypothesis & Variance Analysis**: Documents why fixed-weight validation without TTA exhibits zero metric variance across seeds vs. physical hardware timing jitter.
+
+**CLI Usage**:
+```bash
+# Generate report for the latest benchmark run and archive visual assets
+python src/generate_report.py
+
+# Generate report and automatically clear the results/ folder afterwards
+python src/generate_report.py --clear-results
+
+# Target a specific run ID
+python src/generate_report.py --run-id 2026-10-14_20-30-07
+```
+
+---
+
+## Reports Directory (`reports/`)
+Permanent repository for publication-ready experiment reports:
+```
+reports/
+  evaluation_report_YYYY-MM-DD_HH-MM-SS.md   ← Timestamped research report
+  latest_report.md                           ← Pointer to the most recent evaluation report
+  assets/
+    YYYY-MM-DD_HH-MM-SS/
+      <model_name>/
+        confusion_matrix_normalized.png      ← Archived model confusion matrix
+        BoxPR_curve.png                      ← Archived precision-recall curve
+        BoxF1_curve.png                      ← Archived F1-confidence curve
+        val_batch0_pred.jpg                  ← Archived sample detection batch
+```
 
 

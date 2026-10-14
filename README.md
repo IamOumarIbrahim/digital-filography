@@ -28,11 +28,15 @@ filography/
 ├── docs/
 │   └── main.pdf                  # Research paper
 ├── models/                       # YOLO model weights (yolov8n, yolo11n, yolo12n, yolo26n, yolov10n)
-├── results/                      # Timestamped experiment & benchmark outputs
+├── reports/                      # Publication-grade research reports & archived diagnostic assets
+├── results/                      # Temporary experiment & benchmark run outputs
 └── src/
+    ├── config_manager.py         # Hardware resolution, schema, reproducibility seeds & state
     ├── download_dataset.py       # COCO val2017 per-class dataset downloader
-    ├── resize_dataset.py         # 640x640 bilinear central cropper & annotation bounder
-    ├── run_terminal.py           # Interactive menu terminal
+    ├── eval_engine.py            # Benchmarking, multi-seed evaluation (Mean ± Std) & pipelines
+    ├── generate_report.py        # Report compiler, asset archiver & Pareto analyzer
+    ├── run_terminal.py           # Interactive menu terminal & CLI entry point
+    ├── sweep_confidence.py       # Multi-seed confidence sweep (0.25 to 0.75) evaluator
     └── README.md                 # Detailed documentation for source scripts
 ```
 
